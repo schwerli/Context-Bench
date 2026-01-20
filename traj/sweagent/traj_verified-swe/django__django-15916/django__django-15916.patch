@@ -1,0 +1,158 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 192d9fad94..e065d7a6f6 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -220,12 +220,16 @@ def fields_for_model(
+         if field_classes and f.name in field_classes:
+             kwargs["form_class"] = field_classes[f.name]
+ 
+-        if formfield_callback is None:
++        callback = formfield_callback
++        # Unwrap staticmethod/classmethod descriptors if provided.
++        if isinstance(callback, (staticmethod, classmethod)):
++            callback = callback.__func__
++        if callback is None:
+             formfield = f.formfield(**kwargs)
+-        elif not callable(formfield_callback):
++        elif not callable(callback):
+             raise TypeError("formfield_callback must be a function or callable")
+         else:
+-            formfield = formfield_callback(f, **kwargs)
++            formfield = callback(f, **kwargs)
+ 
+         if formfield:
+             if apply_limit_choices_to:
+@@ -259,11 +263,24 @@ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
+     def __new__(mcs, name, bases, attrs):
+         base_formfield_callback = None
+         for b in bases:
++            # Prefer class-level attribute if present.
++            if hasattr(b, "formfield_callback"):
++                base_formfield_callback = getattr(b, "formfield_callback")
++                break
+             if hasattr(b, "Meta") and hasattr(b.Meta, "formfield_callback"):
+                 base_formfield_callback = b.Meta.formfield_callback
+                 break
+ 
+-        formfield_callback = attrs.pop("formfield_callback", base_formfield_callback)
++        # Prefer an explicit class-level attribute, then the new class's Meta,
++        # then any base class Meta.formfield_callback.
++        meta_in_attrs = attrs.get("Meta")
++        meta_formfield_callback = (
++            getattr(meta_in_attrs, "formfield_callback", None) if meta_in_attrs else None
++        )
++        default_callback = (
++            meta_formfield_callback if meta_formfield_callback is not None else base_formfield_callback
++        )
++        formfield_callback = attrs.pop("formfield_callback", default_callback)
+ 
+         new_class = super().__new__(mcs, name, bases, attrs)
+ 
+@@ -333,6 +350,10 @@ class ModelFormMetaclass(DeclarativeFieldsMetaclass):
+ 
+         new_class.base_fields = fields
+ 
++        # Preserve formfield_callback on the class for subclasses/factories.
++        if formfield_callback is not None:
++            setattr(new_class, "formfield_callback", formfield_callback)
++
+         return new_class
+ 
+ 
+@@ -630,13 +651,15 @@ def modelform_factory(
+     # creating needs to inherit from the parent's inner meta.
+     bases = (form.Meta,) if hasattr(form, "Meta") else ()
+     Meta = type("Meta", bases, attrs)
+-    if formfield_callback:
++    if formfield_callback is not None:
+         Meta.formfield_callback = staticmethod(formfield_callback)
+     # Give this new form class a reasonable name.
+     class_name = model.__name__ + "Form"
+ 
+     # Class attributes for the new form class.
+-    form_class_attrs = {"Meta": Meta, "formfield_callback": formfield_callback}
++    form_class_attrs = {"Meta": Meta}
++    if formfield_callback is not None:
++        form_class_attrs["formfield_callback"] = formfield_callback
+ 
+     if getattr(Meta, "fields", None) is None and getattr(Meta, "exclude", None) is None:
+         raise ImproperlyConfigured(
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..561101428a
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,73 @@
++from django.conf import settings
++settings.configure(
++    SECRET_KEY='x',
++    INSTALLED_APPS=[],
++)
++import django
++django.setup()
++
++from django import forms
++from django.db import models
++
++class MyModel(models.Model):
++    active = models.BooleanField()
++    name = models.CharField(max_length=64, blank=True, null=True)
++
++    class Meta:
++        app_label = 'myapp'
++
++def all_required(field, **kwargs):
++    formfield = field.formfield(**kwargs)
++    formfield.required = True
++    return formfield
++
++class MyForm(forms.ModelForm):
++    class Meta:
++        model = MyModel
++        formfield_callback = staticmethod(all_required)
++        fields = ['active', 'name']
++
++FactoryForm = forms.modelform_factory(MyModel, form=MyForm)
++
++mf = MyForm()
++ff = FactoryForm()
++print('MyForm fields required:', [f.required for f in mf.fields.values()])
++print('FactoryForm fields required:', [f.required for f in ff.fields.values()])
++
++
++# Test base class-level formfield_callback (not Meta)
++class MyForm2(forms.ModelForm):
++    formfield_callback = staticmethod(all_required)
++    class Meta:
++        model = MyModel
++        fields = ['active', 'name']
++
++print('MyForm2 has class-level callback callable?', callable(getattr(MyForm2, 'formfield_callback', None)))
++print('MyForm2 has class-level attr?', hasattr(MyForm2, 'formfield_callback'))
++
++
++FactoryForm2 = forms.modelform_factory(MyModel, form=MyForm2)
++
++mf2 = MyForm2()
++ff2 = FactoryForm2()
++print('MyForm2 fields required:', [f.required for f in mf2.fields.values()])
++print('FactoryForm2 fields required:', [f.required for f in ff2.fields.values()])
++
++
++print('FactoryForm2.formfield_callback attr:', getattr(FactoryForm2, 'formfield_callback', None))
++print('FactoryForm2.Meta has callback?', hasattr(FactoryForm2, 'Meta') and hasattr(FactoryForm2.Meta, 'formfield_callback'))
++
++
++# Test Meta.formfield_callback without staticmethod
++class MyForm3(forms.ModelForm):
++    class Meta:
++        model = MyModel
++        formfield_callback = all_required
++        fields = ['active', 'name']
++
++FactoryForm3 = forms.modelform_factory(MyModel, form=MyForm3)
++
++mf3 = MyForm3()
++ff3 = FactoryForm3()
++print('MyForm3 fields required:', [f.required for f in mf3.fields.values()])
++print('FactoryForm3 fields required:', [f.required for f in ff3.fields.values()])

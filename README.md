@@ -20,13 +20,26 @@ python -m contextbench_eval.evaluate \
 ## Example
 
 ```bash
-cd /data/evaluation
+cd <repo_root>
 
-# Use schwer environment (has tree-sitter installed)
-/home/schwer/miniconda3/envs/schwer/bin/python3 -m contextbench_eval.evaluate \
-    --gold Context-dataset/Verified/annots_pass \
+# Example with parquet gold (recommended)
+python -m contextbench_eval.evaluate \
+    --gold ContextBench_HF/data/full.parquet \
     --pred traj_verified/psf__requests-1142/psf__requests-1142.traj.json \
     --out result.jsonl
+```
+
+## Runner defaults (optional)
+
+Some scripts support environment-variable defaults so you can relocate the repo:
+
+```bash
+export CONTEXTBENCH_GOLD=/path/to/full.parquet
+export CONTEXTBENCH_CACHE=/path/to/repos_cache
+export CONTEXTBENCH_SELECTED_CSV=/path/to/selected_500_instances.csv
+export CONTEXTBENCH_RESULTS_ROOT=/path/to/results
+export CONTEXTBENCH_TRAJ_AGENTLESS=/path/to/agentless_traj_root
+export CONTEXTBENCH_TRAJ_MINISWE=/path/to/miniswe_traj_root
 ```
 
 ## Metrics

@@ -1,0 +1,154 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 59a5d6abbb..c41bfcd067 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1850,11 +1850,49 @@ class SQLUpdateCompiler(SQLCompiler):
+             # Either we're using the idents in multiple update queries (so
+             # don't want them to change), or the db backend doesn't support
+             # selecting from the updating table (e.g. MySQL).
++            # Preselect identifiers from the base table and, when updating
++            # ancestor tables, preselect the corresponding ancestor identifiers
++            # via the child->ancestor parent links to avoid mismatched IDs in
++            # multiple inheritance scenarios.
++            # Build the list of fields to select: base pk first, then one
++            # column per related ancestor link.
++            select_field_names = [query.get_meta().pk.name]
++            related_models = []
++            if self.query.related_updates:
++                opts = query.get_meta()
++                for model in self.query.related_updates.keys():
++                    # Find the parent link from the child (current query model)
++                    # to the ancestor model.
++                    link_field = opts.get_ancestor_link(model)
++                    if link_field is not None:
++                        select_field_names.append(link_field.attname)
++                        related_models.append(model)
++                    else:
++                        # No direct ancestor link found; fall back to selecting
++                        # the child's pk for this ancestor. This is a safe
++                        # fallback for cases where the ancestor shares the
++                        # child's primary key (e.g., first concrete parent).
++                        select_field_names.append(opts.pk.attname)
++                        related_models.append(model)
++            # Select all required identifiers in a single query.
++            query.clear_select_fields()
++            query.add_fields(select_field_names)
+             idents = []
++            related_idents_map = {model: [] for model in related_models}
+             for rows in query.get_compiler(self.using).execute_sql(MULTI):
+-                idents.extend(r[0] for r in rows)
++                for r in rows:
++                    # r[0] is the base pk. Subsequent items map to related_models order.
++                    idents.append(r[0])
++                    for idx, model in enumerate(related_models, start=1):
++                        # Guard against short rows from some backends.
++                        if idx < len(r):
++                            related_idents_map[model].append(r[idx])
++                        else:
++                            related_idents_map[model].append(r[0])
+             self.query.add_filter("pk__in", idents)
+-            self.query.related_ids = idents
++            # Store related identifiers for ancestor updates. When empty,
++            # fall back to base identifiers.
++            self.query.related_ids = related_idents_map or idents
+         else:
+             # The fast path. Filters and updates in one query.
+             self.query.add_filter("pk__in", query)
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..36b5e7214e 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -134,7 +134,18 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # If related_ids is a dict mapping models to lists of identifiers,
++                # use the identifiers corresponding to this model. Otherwise,
++                # assume it's a flat list of child identifiers.
++                if isinstance(self.related_ids, dict):
++                    idents = self.related_ids.get(model, [])
++                    # Fallback to child identifiers if specific ones are missing.
++                    if not idents and None in self.related_ids:
++                        idents = self.related_ids[None]
++                else:
++                    idents = self.related_ids
++                if idents:
++                    query.add_filter("pk__in", idents)
+             result.append(query)
+         return result
+ 
+diff --git a/reproduce_pr.py b/reproduce_pr.py
+new file mode 100644
+index 0000000000..5f694ad30e
+--- /dev/null
++++ b/reproduce_pr.py
+@@ -0,0 +1,68 @@
++import django
++from django.conf import settings
++
++# Configure minimal settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY="test",
++    DATABASES={
++        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
++    },
++    INSTALLED_APPS=[
++        "django.contrib.auth",
++        "django.contrib.contenttypes",
++    ],
++)
++
++django.setup()
++
++from django.db import models, connection
++
++# Define models mimicking PR description
++class Base(models.Model):
++    base_id = models.AutoField(primary_key=True)
++    field_base = models.IntegerField()
++
++    class Meta:
++        app_label = "appliances"
++
++
++class OtherBase(models.Model):
++    otherbase_id = models.AutoField(primary_key=True)
++    field_otherbase = models.IntegerField()
++
++    class Meta:
++        app_label = "appliances"
++
++
++# Child inherits both Base and OtherBase
++class Child(Base, OtherBase):
++    class Meta:
++        app_label = "appliances"
++
++
++# Create tables
++with connection.schema_editor() as editor:
++    editor.create_model(Base)
++    editor.create_model(OtherBase)
++    editor.create_model(Child)
++
++# Populate data
++OtherBase.objects.create(field_otherbase=100)
++OtherBase.objects.create(field_otherbase=101)
++Child.objects.create(field_base=0, field_otherbase=0)
++Child.objects.create(field_base=1, field_otherbase=1)
++
++# Perform update that should affect Child's OtherBase fields only
++rows = Child.objects.update(field_otherbase=55)
++print("Updated rows:", rows)
++print("Child OtherBase fields:", list(Child.objects.values("field_otherbase")))
++print("OtherBase initial parent-only rows (ids 1,2):", list(OtherBase.objects.filter(otherbase_id__in=[1, 2]).values("field_otherbase")))
++
++# Also verify updating field_base only affects Child's Base parents.
++Base.objects.create(field_base=200)
++Base.objects.create(field_base=201)
++rows2 = Child.objects.update(field_base=99)
++print("Updated rows base field:", rows2)
++print("Child Base fields:", list(Child.objects.values("field_base")))
++print("Base initial parent-only rows (exclude child's base_ptrs):", list(Base.objects.filter(base_id__in=[3,4]).values("field_base")))

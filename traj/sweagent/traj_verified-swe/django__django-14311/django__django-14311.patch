@@ -1,0 +1,117 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b6af5f5491..91f783211e 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -223,8 +223,18 @@ def get_child_arguments():
+     # __spec__ is set when the server was started with the `-m` option,
+     # see https://docs.python.org/3/reference/import.html#main-spec
+     # __spec__ may not exist, e.g. when running in a Conda env.
+-    if getattr(__main__, '__spec__', None) is not None and __main__.__spec__.parent:
+-        args += ['-m', __main__.__spec__.parent]
++    if getattr(__main__, '__spec__', None) is not None:
++        # If started with "python -m", __main__.__spec__ is set. Distinguish
++        # between running a package (e.g., "python -m django") and a module
++        # (e.g., "python -m foo.bar.baz"). When running a package, the
++        # __main__ module's spec has name "<package>.__main__" and parent
++        # "<package>". When running a module, spec.name is the full dotted
++        # module path and parent is its containing package.
++        spec = __main__.__spec__
++        name = getattr(spec, 'name', None)
++        parent = getattr(spec, 'parent', None)
++        dotted = parent if (parent and name == parent + '.__main__') else name
++        args += ['-m', dotted]
+         args += sys.argv[1:]
+     elif not py_script.exists():
+         # sys.argv[0] may not exist for several reasons on Windows.
+diff --git a/repro_autoreload.py b/repro_autoreload.py
+new file mode 100644
+index 0000000000..e0d28226dc
+--- /dev/null
++++ b/repro_autoreload.py
+@@ -0,0 +1,20 @@
++import sys
++import types
++from importlib.machinery import ModuleSpec
++from pathlib import Path
++
++from django.utils import autoreload
++
++# Simulate running `python -m foo.bar.baz runserver`
++module = types.ModuleType('__main__')
++spec = ModuleSpec(name='foo.bar.baz', loader=None)
++# For a module (not a package), submodule_search_locations should be None.
++spec.submodule_search_locations = None
++module.__spec__ = spec
++
++# Patch sys.modules and argv to emulate the environment.
++sys.modules['__main__'] = module
++sys.argv = [str(Path(__file__)), 'runserver']
++sys.warnoptions = []
++
++print(autoreload.get_child_arguments())
+diff --git a/repro_django_main.py b/repro_django_main.py
+new file mode 100644
+index 0000000000..674acb5d17
+--- /dev/null
++++ b/repro_django_main.py
+@@ -0,0 +1,11 @@
++import sys
++from pathlib import Path
++
++import django.__main__
++from django.utils import autoreload
++
++sys.modules['__main__'] = django.__main__
++sys.argv = [django.__main__.__file__, 'runserver']
++sys.warnoptions = []
++
++print(autoreload.get_child_arguments())
+diff --git a/repro_package_imported.py b/repro_package_imported.py
+new file mode 100644
+index 0000000000..1ab621a4bf
+--- /dev/null
++++ b/repro_package_imported.py
+@@ -0,0 +1,14 @@
++import sys
++from importlib import import_module
++
++from django.utils import autoreload
++
++# Use a real imported __main__ from a package with __main__.py
++main_mod = import_module('tests.utils_tests.test_module.__main__')
++sys.modules['__main__'] = main_mod
++sys.argv = [main_mod.__file__, 'runserver']
++sys.warnoptions = []
++
++print('spec.name:', main_mod.__spec__.name)
++print('spec.parent:', getattr(main_mod.__spec__, 'parent', None))
++print(autoreload.get_child_arguments())
+diff --git a/repro_package_main.py b/repro_package_main.py
+new file mode 100644
+index 0000000000..eb9b89648e
+--- /dev/null
++++ b/repro_package_main.py
+@@ -0,0 +1,23 @@
++import sys
++import types
++from importlib.machinery import ModuleSpec
++from pathlib import Path
++
++from django.utils import autoreload
++
++# Simulate running `python -m utils_tests.test_module runserver` where test_module is a package.
++module = types.ModuleType('__main__')
++spec = ModuleSpec(name='utils_tests.test_module.__main__', loader=None)
++# For a package, submodule_search_locations is not None and parent is inferred
++# from name by Django's logic.
++spec.submodule_search_locations = []
++module.__spec__ = spec
++
++# Patch sys.modules and argv to emulate the environment.
++sys.modules['__main__'] = module
++sys.argv = [str(Path(__file__)), 'runserver']
++sys.warnoptions = []
++
++print('spec.name:', module.__spec__.name)
++print('spec.parent:', getattr(module.__spec__, 'parent', None))
++print(autoreload.get_child_arguments())

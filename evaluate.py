@@ -12,10 +12,11 @@ import argparse
 import json
 import os
 import sys
+import re
 
 from .core import checkout
 from .parsers import GoldLoader, load_pred, parse_trajectory, parse_diff
-from .extractors import extract_def_set_in_spans
+from .extractors import extract_def_set_in_spans, extract_def_set_from_symbol_names
 from .metrics import compute_granularity_metrics, compute_trajectory_metrics, span_total_bytes, span_intersection_bytes, coverage_precision
 
 
@@ -26,6 +27,10 @@ def evaluate_instance(instance_id: str, gold, pred_data: dict, cache_dir: str) -
     # Setup repository
     repo_url = pred_data.get("repo_url") or gold.repo_url
     commit = pred_data.get("commit") or gold.commit
+
+    # If gold came from parquet, it may not have a repo_url; resolve from original_inst_id.
+    if not repo_url:
+        repo_url = _resolve_repo_from_original_id(getattr(gold, "id", ""), cache_dir)
     
     print(f"  Repo: {repo_url}", file=sys.stderr)
     print(f"  Commit: {commit[:12]}...", file=sys.stderr)
@@ -56,7 +61,10 @@ def evaluate_instance(instance_id: str, gold, pred_data: dict, cache_dir: str) -
     # Get final pred representations
     final_files = set(final_step.files)
     final_spans = _step_spans(final_step, repo_dir)
-    final_symbols = extract_def_set_in_spans(final_spans, repo_dir)
+    if getattr(final_step, "symbols", None):
+        final_symbols = extract_def_set_from_symbol_names(final_step.symbols, repo_dir)
+    else:
+        final_symbols = extract_def_set_in_spans(final_spans, repo_dir)
     
     # Compute final metrics
     results = {
@@ -74,25 +82,82 @@ def evaluate_instance(instance_id: str, gold, pred_data: dict, cache_dir: str) -
     )
     
     # EditLoc metrics (use init_ctx as gold edit location)
-    model_patch = pred_data.get("model_patch", "")
+    # init_ctx contains context, so we check if pred edits fall within init_ctx ranges
+    # For EditLoc, we only care about deleted lines (-), not added lines (+)
+    model_patch = pred_data.get("model_patch", "") or ""
+    if not model_patch:
+        # Fallback: use gold patch if present (parquet provides it as `patch`)
+        model_patch = getattr(gold, "_data", {}).get("patch", "") or ""
     if model_patch:
-        pred_edits = parse_diff(model_patch, repo_dir)
-        gold_init_spans = gold.byte_spans_init(repo_dir)
+        from .parsers.diff import parse_diff_lines
         
-        pred_bytes = span_total_bytes(pred_edits)
-        gold_bytes = span_total_bytes(gold_init_spans)
-        inter_bytes = span_intersection_bytes(pred_edits, gold_init_spans)
-        recall, precision = coverage_precision(pred_bytes, gold_bytes, inter_bytes)
+        pred_line_edits = parse_diff_lines(model_patch, deletions_only=True)
+        gold_line_spans = gold.line_spans_init()
+        
+        # Build a map of file -> set of line ranges for gold
+        gold_ranges_by_file = {}
+        for file_path, intervals in gold_line_spans.items():
+            gold_ranges_by_file[file_path] = intervals
+        
+        # Check each pred edit line to see if it falls within any gold range
+        pred_lines = []
+        pred_lines_in_gold = []
+        
+        for file_path, intervals in pred_line_edits.items():
+            gold_ranges = gold_ranges_by_file.get(file_path, [])
+            for start, end in intervals:
+                for line_num in range(start, end + 1):
+                    pred_lines.append((file_path, line_num))
+                    # Check if this line falls within any gold range
+                    in_gold = False
+                    for gold_start, gold_end in gold_ranges:
+                        if gold_start <= line_num <= gold_end:
+                            in_gold = True
+                            break
+                    if in_gold:
+                        pred_lines_in_gold.append((file_path, line_num))
+        
+        pred_line_count = len(pred_lines)
+        hit_count = len(pred_lines_in_gold)
+        
+        # Recall and Precision: both measure how many pred edits are within gold ranges
+        # Since init_ctx is context, we want to know: are the edits in the right area?
+        recall = hit_count / pred_line_count if pred_line_count > 0 else 0.0
+        precision = hit_count / pred_line_count if pred_line_count > 0 else 0.0
+        
+        # Gold size: total lines in init_ctx ranges (for reference)
+        gold_line_count = sum(
+            end - start + 1
+            for intervals in gold_line_spans.values()
+            for start, end in intervals
+        )
         
         results["editloc"] = {
             "recall": recall,
             "precision": precision,
-            "intersection": inter_bytes,
-            "gold_size": gold_bytes,
-            "pred_size": pred_bytes
+            "intersection": hit_count,
+            "gold_size": gold_line_count,
+            "pred_size": pred_line_count
         }
     
     return results
+
+
+def _resolve_repo_from_original_id(original_inst_id: str, cache_dir: str) -> str:
+    """Resolve a repo URL or local path from an original instance id like 'owner__repo-1234'."""
+    s = (original_inst_id or "").strip()
+    m = re.match(r"^([A-Za-z0-9_.-]+)__([A-Za-z0-9_.-]+)-\d+$", s)
+    if not m:
+        return ""
+    owner, repo = m.group(1), m.group(2)
+
+    # Prefer a local cache clone under cache_dir (created by previous runs).
+    local = os.path.join(cache_dir, f"github.com__{owner}__{repo}")
+    if os.path.isdir(os.path.join(local, ".git")):
+        return local
+
+    # Fallback to GitHub URL.
+    return f"https://github.com/{owner}/{repo}.git"
 
 
 def aggregate_results(results: list) -> dict:

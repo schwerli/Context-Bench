@@ -1,0 +1,78 @@
+diff --git a/repro_iter_center.py b/repro_iter_center.py
+new file mode 100644
+index 00000000..61566c00
+--- /dev/null
++++ b/repro_iter_center.py
+@@ -0,0 +1,12 @@
++import sys
++sys.path.insert(0, "/testbed")
++import numpy as np
++import xarray as xr
++
++# Reproduce issue: iterating over DataArrayRolling with center=True yields non-centered windows
++my_data = xr.DataArray(np.arange(1,10), dims="x")
++result1 = my_data.rolling(x=3, center=True).mean().values
++rolling_iter = my_data.rolling(x=3, center=True)
++result2 = [window.mean().values.item() for label, window in rolling_iter]
++print("rolling.mean (center=True):", result1.tolist())
++print("manual iteration mean:", result2)
+diff --git a/repro_more.py b/repro_more.py
+new file mode 100644
+index 00000000..69ebbaca
+--- /dev/null
++++ b/repro_more.py
+@@ -0,0 +1,20 @@
++import sys
++sys.path.insert(0, "/testbed")
++import numpy as np
++import xarray as xr
++
++for w in [3, 4, 5]:
++    for mp in [None, 1, 3]:
++        data = xr.DataArray(np.arange(1,13), dims="x")
++        roll = data.rolling(x=w, center=True, min_periods=mp)
++        r1 = roll.mean().values
++        manual = [win.mean().values.item() for lbl, win in roll]
++        print(f"w={w}, min_periods={mp}: equal={np.all((np.isnan(r1) & np.isnan(manual)) | (np.equal(r1, manual))) }")
++
++for w in [3,4,5]:
++    for mp in [None, 1, 3]:
++        data = xr.DataArray(np.arange(1,13), dims="x")
++        roll = data.rolling(x=w, center=False, min_periods=mp)
++        r1 = roll.mean().values
++        manual = [win.mean().values.item() for lbl, win in roll]
++        print(f"left w={w}, min_periods={mp}: equal={np.all((np.isnan(r1) & np.isnan(manual)) | (np.equal(r1, manual))) }")
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index aef290f6..b9ded0c5 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -270,11 +270,25 @@ class DataArrayRolling(Rolling["DataArray"]):
+     def __iter__(self) -> Iterator[tuple[RollingKey, DataArray]]:
+         if self.ndim > 1:
+             raise ValueError("__iter__ is only supported for 1d-rolling")
+-        stops = np.arange(1, len(self.window_labels) + 1)
+-        starts = stops - int(self.window[0])
+-        starts[: int(self.window[0])] = 0
++        n = len(self.window_labels)
++        w = int(self.window[0])
++        if self.center[0]:
++            # Center-justified windows: for each label i, take a window centered on i
++            # Compute start and stop indices with clamping to array bounds
++            offset_start = w // 2
++            offset_end = w - 1 - offset_start
++            indices = np.arange(n)
++            starts = indices - offset_start
++            stops = indices + offset_end + 1
++            starts = np.maximum(0, starts)
++            stops = np.minimum(n, stops)
++        else:
++            # Left-justified windows ending at each position
++            stops = np.arange(1, n + 1)
++            starts = stops - w
++            starts[:w] = 0
+         for (label, start, stop) in zip(self.window_labels, starts, stops):
+-            window = self.obj.isel({self.dim[0]: slice(start, stop)})
++            window = self.obj.isel({self.dim[0]: slice(int(start), int(stop))})
+ 
+             counts = window.count(dim=self.dim[0])
+             window = window.where(counts >= self.min_periods)

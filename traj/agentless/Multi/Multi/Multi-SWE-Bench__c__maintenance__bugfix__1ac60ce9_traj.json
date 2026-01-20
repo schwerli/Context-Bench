@@ -1,0 +1,92 @@
+{
+  "instance_id": "Multi-SWE-Bench__c__maintenance__bugfix__1ac60ce9",
+  "original_id": "ponylang__ponyc-2247",
+  "1_model_selected_files": [],
+  "2_embedding_selected_files": [
+    "src/libponyrt/gc/serialise.c",
+    "src/libponyc/codegen/genserialise.c",
+    "src/libponyc/codegen/genprim.c",
+    "src/libponyrt/gc/serialise.h",
+    "src/libponyc/pass/serialisers.c",
+    "src/libponyc/pkg/program.c",
+    "src/libponyc/codegen/genexe.c",
+    "src/libponyc/reach/reach.c",
+    "src/libponyc/verify/fun.c",
+    "src/libponyc/ast/stringtab.c",
+    "src/libponyc/ast/ast.c",
+    "src/libponyc/ast/source.c",
+    "src/libponyc/codegen/genserialise.h",
+    "src/libponyrt/pony.h",
+    "src/libponyc/codegen/gencall.c",
+    "src/libponyc/codegen/codegen.c",
+    "src/libponyc/codegen/gendesc.c",
+    "src/libponyrt/gc/gc.c",
+    "src/libponyc/pass/serialisers.h",
+    "src/libponyc/ast/token.c",
+    "src/libponyc/codegen/gentype.c",
+    "src/libponyc/pass/sugar.c",
+    "src/libponyc/codegen/gentrace.c",
+    "src/libponyc/ast/symtab.c",
+    "src/libponyc/codegen/genfun.c",
+    "src/libponyc/codegen/genreference.c",
+    "src/libponyc/type/safeto.c",
+    "src/libponyc/pkg/package.c",
+    "src/libponyc/codegen/codegen.h"
+  ],
+  "3_final_combined_files": [
+    "src/libponyrt/gc/serialise.c",
+    "src/libponyc/codegen/genserialise.c",
+    "src/libponyc/codegen/genprim.c"
+  ],
+  "4_related_elements": {
+    "src/libponyc/codegen/genprim.c": [
+      "function: genprim_string_serialise_trace\nfunction: genprim_string_serialise\nfunction: genprim_string_deserialise\nfunction: genprim_array_serialise_trace\nfunction: genprim_array_serialise\nfunction: genprim_array_deserialise"
+    ],
+    "src/libponyc/codegen/genserialise.c": [
+      "function: genserialise_element"
+    ],
+    "src/libponyrt/gc/serialise.c": [
+      "function: pony_serialise_reserve\nfunction: pony_serialise_offset\nfunction: pony_deserialise_block"
+    ]
+  },
+  "5_sampled_edit_locs_and_patches": [
+    {
+      "sample_index": 0,
+      "edit_locs": {
+        "src/libponyc/codegen/genprim.c": [
+          "function: genprim_string_serialise_trace\nfunction: genprim_string_serialise"
+        ],
+        "src/libponyrt/gc/serialise.c": [
+          "function: pony_serialise_offset"
+        ],
+        "src/libponyc/codegen/genserialise.c": [
+          ""
+        ]
+      },
+      "patches": [
+        "diff --git a/src/libponyc/codegen/genprim.c b/src/libponyc/codegen/genprim.c\nindex 94f07ca..a03066b 100644\n--- a/src/libponyc/codegen/genprim.c\n+++ b/src/libponyc/codegen/genprim.c\n@@ -1047,9 +1047,8 @@ void genprim_string_serialise_trace(compile_t* c, reach_type_t* t)\n   LLVMBasicBlockRef trace_block = codegen_block(c, \"trace\");\n   LLVMBasicBlockRef post_block = codegen_block(c, \"post\");\n \n-  LLVMValueRef cond = LLVMBuildICmp(c->builder, LLVMIntNE, size,\n-    LLVMConstInt(c->intptr, 0, false), \"\");\n-  LLVMBuildCondBr(c->builder, cond, trace_block, post_block);\n+  // Always reserve at least one byte (null terminator) even for empty strings.\n+  LLVMBuildBr(c->builder, trace_block);\n \n   LLVMPositionBuilderAtEnd(c->builder, trace_block);\n \n",
+        "diff --git a/src/libponyc/codegen/genprim.c b/src/libponyc/codegen/genprim.c\nindex 94f07ca..a4b9706 100644\n--- a/src/libponyc/codegen/genprim.c\n+++ b/src/libponyc/codegen/genprim.c\n@@ -1118,7 +1118,18 @@ void genprim_string_serialise(compile_t* c, reach_type_t* t)\n     c->intptr, 2);\n   LLVMBuildStore(c->builder, alloc, alloc_loc);\n \n-  // Write the pointer.\n+  // Write the pointer offset and serialise contents only if size != 0.\n+  LLVMValueRef ptr_loc = field_loc(c, offset_addr, c_t->structure, c->intptr, 3);\n+\n+  LLVMBasicBlockRef nonzero_block = codegen_block(c, \"nonzero\");\n+  LLVMBasicBlockRef zero_block = codegen_block(c, \"zero\");\n+\n+  LLVMValueRef nonzero = LLVMBuildICmp(c->builder, LLVMIntNE, size,\n+    LLVMConstInt(c->intptr, 0, false), \"\");\n+  LLVMBuildCondBr(c->builder, nonzero, nonzero_block, zero_block);\n+\n+  // Non-zero size: compute offset and copy contents.\n+  LLVMPositionBuilderAtEnd(c->builder, nonzero_block);\n   LLVMValueRef ptr = field_value(c, object, 3);\n \n   LLVMValueRef args[5];\n@@ -1126,17 +1137,16 @@ void genprim_string_serialise(compile_t* c, reach_type_t* t)\n   args[1] = ptr;\n   LLVMValueRef ptr_offset = gencall_runtime(c, \"pony_serialise_offset\",\n     args, 2, \"\");\n-\n-  LLVMValueRef ptr_loc = field_loc(c, offset_addr, c_t->structure, c->intptr, 3);\n   LLVMBuildStore(c->builder, ptr_offset, ptr_loc);\n \n-  // Serialise the string contents.\n-  LLVMValueRef dst =  LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1,\n-    \"\");\n-  LLVMValueRef src = LLVMBuildBitCast(c->builder, field_value(c, object, 3),\n-    c->void_ptr, \"\");\n+  LLVMValueRef dst = LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1, \"\");\n+  LLVMValueRef src = LLVMBuildBitCast(c->builder, ptr, c->void_ptr, \"\");\n   gencall_memcpy(c, dst, src, alloc);\n+  LLVMBuildBr(c->builder, post_block);\n \n+  // Zero size: set pointer offset to ALL_BITS and skip copy.\n+  LLVMPositionBuilderAtEnd(c->builder, zero_block);\n+  LLVMBuildStore(c->builder, LLVMConstAllOnes(c->intptr), ptr_loc);\n   LLVMBuildBr(c->builder, post_block);\n   LLVMPositionBuilderAtEnd(c->builder, post_block);\n   LLVMBuildRetVoid(c->builder);\n"
+      ]
+    },
+    {
+      "sample_index": 1,
+      "edit_locs": {
+        "src/libponyc/codegen/genprim.c": [
+          "function: genprim_string_serialise_trace\nline: 1035\nline: 1050\nline: 1051\nline: 1052\nline: 1056\nline: 1057\nline: 1058"
+        ],
+        "src/libponyrt/gc/serialise.c": [
+          ""
+        ],
+        "src/libponyc/codegen/genserialise.c": [
+          ""
+        ]
+      },
+      "patches": [
+        "diff --git a/src/libponyc/codegen/genprim.c b/src/libponyc/codegen/genprim.c\nindex 94f07ca..d6bc60d 100644\n--- a/src/libponyc/codegen/genprim.c\n+++ b/src/libponyc/codegen/genprim.c\n@@ -1056,9 +1056,16 @@ void genprim_string_serialise_trace(compile_t* c, reach_type_t* t)\n   LLVMValueRef alloc = LLVMBuildAdd(c->builder, size,\n     LLVMConstInt(c->intptr, 1, false), \"\");\n \n-  // Reserve space for the contents.\n+  // Reserve space for the contents, only if the pointer is non-null.\n   LLVMValueRef ptr = field_value(c, object, 3);\n \n+  LLVMBasicBlockRef reserve_block = codegen_block(c, \"reserve\");\n+  LLVMValueRef ptr_non_null = LLVMBuildICmp(c->builder, LLVMIntNE, ptr,\n+    LLVMConstNull(LLVMTypeOf(ptr)), \"\");\n+  LLVMBuildCondBr(c->builder, ptr_non_null, reserve_block, post_block);\n+\n+  LLVMPositionBuilderAtEnd(c->builder, reserve_block);\n+\n   LLVMValueRef args[3];\n   args[0] = ctx;\n   args[1] = ptr;\n",
+        "diff --git a/src/libponyc/codegen/genprim.c b/src/libponyc/codegen/genprim.c\nindex 94f07ca..77ed7dc 100644\n--- a/src/libponyc/codegen/genprim.c\n+++ b/src/libponyc/codegen/genprim.c\n@@ -1130,13 +1130,24 @@ void genprim_string_serialise(compile_t* c, reach_type_t* t)\n   LLVMValueRef ptr_loc = field_loc(c, offset_addr, c_t->structure, c->intptr, 3);\n   LLVMBuildStore(c->builder, ptr_offset, ptr_loc);\n \n-  // Serialise the string contents.\n-  LLVMValueRef dst =  LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1,\n-    \"\");\n+  // Serialise the string contents only if size > 0. For empty strings, the\n+  // pointer may be NULL and pony_serialise_offset will return ALL_BITS. In that\n+  // case we must not attempt to compute a destination pointer or memcpy.\n+  LLVMBasicBlockRef copy_block = codegen_block(c, \"copy\");\n+  LLVMBasicBlockRef nocopy_block = codegen_block(c, \"nocopy\");\n+\n+  LLVMValueRef has_data = LLVMBuildICmp(c->builder, LLVMIntNE, size,\n+    LLVMConstInt(c->intptr, 0, false), \"\");\n+  LLVMBuildCondBr(c->builder, has_data, copy_block, nocopy_block);\n+\n+  LLVMPositionBuilderAtEnd(c->builder, copy_block);\n+  LLVMValueRef dst = LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1, \"\");\n   LLVMValueRef src = LLVMBuildBitCast(c->builder, field_value(c, object, 3),\n     c->void_ptr, \"\");\n   gencall_memcpy(c, dst, src, alloc);\n+  LLVMBuildBr(c->builder, nocopy_block);\n \n+  LLVMPositionBuilderAtEnd(c->builder, nocopy_block);\n   LLVMBuildBr(c->builder, post_block);\n   LLVMPositionBuilderAtEnd(c->builder, post_block);\n   LLVMBuildRetVoid(c->builder);\n"
+      ]
+    }
+  ],
+  "6_final_selected_patch": "diff --git a/src/libponyc/codegen/genprim.c b/src/libponyc/codegen/genprim.c\nindex 94f07ca..a4b9706 100644\n--- a/src/libponyc/codegen/genprim.c\n+++ b/src/libponyc/codegen/genprim.c\n@@ -1118,7 +1118,18 @@ void genprim_string_serialise(compile_t* c, reach_type_t* t)\n     c->intptr, 2);\n   LLVMBuildStore(c->builder, alloc, alloc_loc);\n \n-  // Write the pointer.\n+  // Write the pointer offset and serialise contents only if size != 0.\n+  LLVMValueRef ptr_loc = field_loc(c, offset_addr, c_t->structure, c->intptr, 3);\n+\n+  LLVMBasicBlockRef nonzero_block = codegen_block(c, \"nonzero\");\n+  LLVMBasicBlockRef zero_block = codegen_block(c, \"zero\");\n+\n+  LLVMValueRef nonzero = LLVMBuildICmp(c->builder, LLVMIntNE, size,\n+    LLVMConstInt(c->intptr, 0, false), \"\");\n+  LLVMBuildCondBr(c->builder, nonzero, nonzero_block, zero_block);\n+\n+  // Non-zero size: compute offset and copy contents.\n+  LLVMPositionBuilderAtEnd(c->builder, nonzero_block);\n   LLVMValueRef ptr = field_value(c, object, 3);\n \n   LLVMValueRef args[5];\n@@ -1126,17 +1137,16 @@ void genprim_string_serialise(compile_t* c, reach_type_t* t)\n   args[1] = ptr;\n   LLVMValueRef ptr_offset = gencall_runtime(c, \"pony_serialise_offset\",\n     args, 2, \"\");\n-\n-  LLVMValueRef ptr_loc = field_loc(c, offset_addr, c_t->structure, c->intptr, 3);\n   LLVMBuildStore(c->builder, ptr_offset, ptr_loc);\n \n-  // Serialise the string contents.\n-  LLVMValueRef dst =  LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1,\n-    \"\");\n-  LLVMValueRef src = LLVMBuildBitCast(c->builder, field_value(c, object, 3),\n-    c->void_ptr, \"\");\n+  LLVMValueRef dst = LLVMBuildInBoundsGEP(c->builder, addr, &ptr_offset, 1, \"\");\n+  LLVMValueRef src = LLVMBuildBitCast(c->builder, ptr, c->void_ptr, \"\");\n   gencall_memcpy(c, dst, src, alloc);\n+  LLVMBuildBr(c->builder, post_block);\n \n+  // Zero size: set pointer offset to ALL_BITS and skip copy.\n+  LLVMPositionBuilderAtEnd(c->builder, zero_block);\n+  LLVMBuildStore(c->builder, LLVMConstAllOnes(c->intptr), ptr_loc);\n   LLVMBuildBr(c->builder, post_block);\n   LLVMPositionBuilderAtEnd(c->builder, post_block);\n   LLVMBuildRetVoid(c->builder);\n",
+  "7_resolved": true
+}

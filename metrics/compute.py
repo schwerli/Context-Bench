@@ -61,7 +61,7 @@ def compute_trajectory_metrics(
     repo_dir: str
 ) -> dict:
     """Compute AUC-Coverage, Redundancy, and per-step metrics."""
-    from ..extractors import extract_def_set_in_spans
+    from ..extractors import extract_def_set_in_spans, extract_def_set_from_symbol_names
     from ..core.intervals import merge
     
     T = len(steps)
@@ -81,7 +81,10 @@ def compute_trajectory_metrics(
         # Convert step to representations
         step_files = set(step.files)
         step_spans = _step_to_byte_spans(step, repo_dir)
-        step_symbols = extract_def_set_in_spans(step_spans, repo_dir)
+        if getattr(step, "symbols", None):
+            step_symbols = extract_def_set_from_symbol_names(step.symbols, repo_dir)
+        else:
+            step_symbols = extract_def_set_in_spans(step_spans, repo_dir)
         
         # Update unions
         union_files |= step_files

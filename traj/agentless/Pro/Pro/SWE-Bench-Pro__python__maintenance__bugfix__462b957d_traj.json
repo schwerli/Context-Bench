@@ -1,0 +1,93 @@
+{
+    "instance_id": "SWE-Bench-Pro__python__maintenance__bugfix__462b957d",
+    "original_id": "instance_ansible__ansible-942424e10b2095a173dbd78e7128f52f7995849b-v30a923fb5c164d6cd18280c02422f75e611e8fb2",
+    "1_model_selected_files": [
+        "lib/ansible/plugins/connection/winrm.py"
+    ],
+    "2_embedding_selected_files": [
+        "lib/ansible/plugins/connection/winrm.py",
+        "lib/ansible/plugins/connection/ssh.py",
+        "lib/ansible/plugins/action/wait_for_connection.py",
+        "lib/ansible/plugins/connection/psrp.py",
+        "lib/ansible/plugins/connection/local.py",
+        "lib/ansible/executor/task_executor.py",
+        "lib/ansible/plugins/connection/__init__.py",
+        "lib/ansible/plugins/action/reboot.py",
+        "lib/ansible/module_utils/connection.py",
+        "lib/ansible/modules/wait_for.py",
+        "lib/ansible/cli/scripts/ansible_connection_cli_stub.py",
+        "lib/ansible/plugins/connection/paramiko_ssh.py",
+        "lib/ansible/modules/wait_for_connection.py",
+        "lib/ansible/plugins/action/pause.py",
+        "lib/ansible/plugins/terminal/__init__.py",
+        "lib/ansible/plugins/action/gather_facts.py",
+        "lib/ansible/plugins/action/script.py",
+        "lib/ansible/plugins/cliconf/__init__.py",
+        "lib/ansible/modules/shell.py",
+        "lib/ansible/plugins/action/__init__.py",
+        "lib/ansible/executor/process/worker.py",
+        "lib/ansible/plugins/become/runas.py",
+        "lib/ansible/executor/action_write_locks.py",
+        "lib/ansible/plugins/shell/cmd.py",
+        "lib/ansible/plugins/action/raw.py",
+        "lib/ansible/plugins/doc_fragments/connection_pipelining.py",
+        "lib/ansible/plugins/lookup/pipe.py",
+        "lib/ansible/utils/display.py",
+        "lib/ansible/plugins/strategy/free.py"
+    ],
+    "3_final_combined_files": [
+        "lib/ansible/plugins/connection/winrm.py",
+        "lib/ansible/plugins/connection/ssh.py",
+        "lib/ansible/plugins/action/wait_for_connection.py"
+    ],
+    "4_related_elements": {
+        "lib/ansible/plugins/connection/winrm.py": [
+            "function: Connection._build_winrm_kwargs\nfunction: Connection._winrm_connect\nfunction: Connection._winrm_write_stdin\nfunction: Connection._winrm_send_input\nfunction: Connection._winrm_exec\nfunction: Connection.exec_command\nfunction: Connection._wrapper_payload_stream\nfunction: Connection._put_file_stdin_iterator\nfunction: Connection.put_file\nfunction: Connection.fetch_file\nfunction: Connection.reset\nfunction: Connection.close\nvariable: ansible_winrm_connection_timeout"
+        ],
+        "lib/ansible/plugins/action/wait_for_connection.py": [
+            "class: ActionModule\nfunction: ActionModule.do_until_success_or_timeout\nvariable: DEFAULT_TIMEOUT\nvariable: DEFAULT_CONNECT_TIMEOUT\nvariable: DEFAULT_SLEEP\nvariable: DEFAULT_DELAY\nclass: TimedOutException"
+        ],
+        "lib/ansible/plugins/connection/ssh.py": [
+            ""
+        ]
+    },
+    "5_sampled_edit_locs_and_patches": [
+        {
+            "sample_index": 0,
+            "edit_locs": {
+                "lib/ansible/plugins/connection/winrm.py": [
+                    "function: Connection._winrm_exec\nline: 578\nline: 594\nfunction: Connection._get_command_output_with_timeout"
+                ],
+                "lib/ansible/plugins/connection/ssh.py": [
+                    ""
+                ],
+                "lib/ansible/plugins/action/wait_for_connection.py": [
+                    ""
+                ]
+            },
+            "patches": [
+                "diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py\nindex 8d38681..002a487 100644\n--- a/lib/ansible/plugins/connection/winrm.py\n+++ b/lib/ansible/plugins/connection/winrm.py\n@@ -577,7 +577,31 @@ class Connection(ConnectionBase):\n \n             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).\n             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            # If stdin push failed, attempt to retrieve output with a bounded timeout to avoid indefinite hang.\n+            if stdin_push_failed:\n+                import threading\n+                result_holder = {'resptuple': None, 'exc': None}\n+\n+                def _get_output():\n+                    try:\n+                        result_holder['resptuple'] = self.protocol.get_command_output(self.shell_id, command_id)\n+                    except Exception as e:\n+                        result_holder['exc'] = e\n+\n+                t = threading.Thread(target=_get_output, daemon=True)\n+                t.start()\n+                timeout_sec = getattr(self.protocol, 'operation_timeout_sec', None)\n+                if not timeout_sec or timeout_sec <= 0:\n+                    timeout_sec = 30\n+                t.join(timeout_sec)\n+                if t.is_alive():\n+                    display.warning(\"WINRM RECEIVE timed out while recovering from stdin send failure; aborting output retrieval\")\n+                    raise AnsibleError('winrm send_input failed; output retrieval timed out')\n+                if result_holder['exc']:\n+                    raise result_holder['exc']\n+                resptuple = result_holder['resptuple']\n+            else:\n+                resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n             # ensure stdout/stderr are text for py3\n             # FUTURE: this should probably be done internally by pywinrm\n             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))\n",
+                "diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py\nindex 8d38681..0851416 100644\n--- a/lib/ansible/plugins/connection/winrm.py\n+++ b/lib/ansible/plugins/connection/winrm.py\n@@ -577,7 +577,25 @@ class Connection(ConnectionBase):\n \n             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).\n             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            # If stdin push failed, enforce a bounded read timeout for a single output retrieval attempt\n+            original_read_timeout = getattr(self.protocol, 'read_timeout_sec', None)\n+            if stdin_push_failed:\n+                try:\n+                    # Use a conservative timeout to avoid indefinite hangs after stdin write failure\n+                    if original_read_timeout is None or original_read_timeout > 15:\n+                        self.protocol.read_timeout_sec = 15\n+                except Exception:\n+                    # If we cannot adjust the timeout, proceed; the outer timeout handler will still catch request timeouts\n+                    pass\n+            try:\n+                resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            finally:\n+                # Restore the original timeout if we changed it\n+                if stdin_push_failed and original_read_timeout is not None:\n+                    try:\n+                        self.protocol.read_timeout_sec = original_read_timeout\n+                    except Exception:\n+                        pass\n             # ensure stdout/stderr are text for py3\n             # FUTURE: this should probably be done internally by pywinrm\n             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))\n@@ -608,6 +626,8 @@ class Connection(ConnectionBase):\n \n             return response\n         except requests.exceptions.Timeout as exc:\n+            if 'stdin_push_failed' in locals() and stdin_push_failed:\n+                raise AnsibleError('winrm get_output timed out after stdin send_input failure; aborting: %s' % to_native(exc))\n             raise AnsibleConnectionFailure('winrm connection error: %s' % to_native(exc))\n         finally:\n             if command_id:\n"
+            ]
+        },
+        {
+            "sample_index": 1,
+            "edit_locs": {
+                "lib/ansible/plugins/connection/winrm.py": [
+                    "function: Connection._winrm_exec\nline: 569\nline: 579"
+                ],
+                "lib/ansible/plugins/connection/ssh.py": [
+                    ""
+                ],
+                "lib/ansible/plugins/action/wait_for_connection.py": [
+                    ""
+                ]
+            },
+            "patches": [
+                "diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py\nindex 8d38681..1b61722 100644\n--- a/lib/ansible/plugins/connection/winrm.py\n+++ b/lib/ansible/plugins/connection/winrm.py\n@@ -576,8 +576,32 @@ class Connection(ConnectionBase):\n                 stdin_push_failed = True\n \n             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).\n-            # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            # To avoid indefinite hang after a stdin send failure, attempt to retrieve output only once with a timeout.\n+            if stdin_push_failed:\n+                result_holder = {'value': None, 'exc': None}\n+                def _fetch_output_once():\n+                    try:\n+                        result_holder['value'] = self.protocol.get_command_output(self.shell_id, command_id)\n+                    except Exception as e:\n+                        result_holder['exc'] = e\n+                import threading\n+                timeout_sec = getattr(self.protocol, 'read_timeout_sec', None)\n+                if not timeout_sec:\n+                    timeout_sec = getattr(self, '_winrm_read_timeout_sec', 30)\n+                fetch_thread = threading.Thread(target=_fetch_output_once, name='winrm-get-output-once')\n+                fetch_thread.daemon = True\n+                fetch_thread.start()\n+                fetch_thread.join(timeout_sec)\n+                if fetch_thread.is_alive():\n+                    display.warning(\"ERROR DURING WINRM RECEIVE OUTPUT - timed out after stdin send failure\")\n+                    raise AnsibleError('winrm get_command_output timed out after stdin send failure')\n+                if result_holder['exc'] is not None:\n+                    # propagate errors from the fetch attempt\n+                    raise result_holder['exc']\n+                resptuple = result_holder['value']\n+            else:\n+                # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n+                resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n             # ensure stdout/stderr are text for py3\n             # FUTURE: this should probably be done internally by pywinrm\n             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))\n",
+                "diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py\nindex 8d38681..2acea7e 100644\n--- a/lib/ansible/plugins/connection/winrm.py\n+++ b/lib/ansible/plugins/connection/winrm.py\n@@ -546,6 +546,32 @@ class Connection(ConnectionBase):\n             stream['@End'] = 'true'\n         protocol.send_message(xmltodict.unparse(rq))\n \n+    def _get_command_output_with_timeout(self, shell_id, command_id, timeout_sec):\n+        # Attempt to call get_command_output with a timeout kwarg if supported by pywinrm.\n+        try:\n+            return self.protocol.get_command_output(shell_id, command_id, timeout=timeout_sec)\n+        except TypeError:\n+            # Fallback: run get_command_output in a background thread and enforce a join timeout.\n+            import threading\n+            result = {}\n+            error = {}\n+\n+            def _target():\n+                try:\n+                    result['value'] = self.protocol.get_command_output(shell_id, command_id)\n+                except Exception as e:\n+                    error['exc'] = e\n+\n+            t = threading.Thread(target=_target, daemon=True)\n+            t.start()\n+            t.join(timeout_sec)\n+            if t.is_alive():\n+                # Timed out waiting for output retrieval; raise a clear error to avoid indefinite hang.\n+                raise AnsibleError('winrm send_input failed and output retrieval timed out after %ss' % timeout_sec)\n+            if 'exc' in error:\n+                raise error['exc']\n+            return result['value']\n+\n     def _winrm_exec(\n         self,\n         command: str,\n@@ -577,7 +603,15 @@ class Connection(ConnectionBase):\n \n             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).\n             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            if stdin_push_failed:\n+                # Attempt to get output only once with a timeout to prevent indefinite hang.\n+                timeout = getattr(self, '_winrm_read_timeout', None)\n+                if not timeout:\n+                    timeout = 60\n+                resptuple = self._get_command_output_with_timeout(self.shell_id, command_id, timeout)\n+            else:\n+                resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+\n             # ensure stdout/stderr are text for py3\n             # FUTURE: this should probably be done internally by pywinrm\n             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))\n"
+            ]
+        }
+    ],
+    "6_final_selected_patch": "diff --git a/lib/ansible/plugins/connection/winrm.py b/lib/ansible/plugins/connection/winrm.py\nindex 8d38681..002a487 100644\n--- a/lib/ansible/plugins/connection/winrm.py\n+++ b/lib/ansible/plugins/connection/winrm.py\n@@ -577,7 +577,31 @@ class Connection(ConnectionBase):\n \n             # NB: this can hang if the receiver is still running (eg, network failed a Send request but the server's still happy).\n             # FUTURE: Consider adding pywinrm status check/abort operations to see if the target is still running after a failure.\n-            resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n+            # If stdin push failed, attempt to retrieve output with a bounded timeout to avoid indefinite hang.\n+            if stdin_push_failed:\n+                import threading\n+                result_holder = {'resptuple': None, 'exc': None}\n+\n+                def _get_output():\n+                    try:\n+                        result_holder['resptuple'] = self.protocol.get_command_output(self.shell_id, command_id)\n+                    except Exception as e:\n+                        result_holder['exc'] = e\n+\n+                t = threading.Thread(target=_get_output, daemon=True)\n+                t.start()\n+                timeout_sec = getattr(self.protocol, 'operation_timeout_sec', None)\n+                if not timeout_sec or timeout_sec <= 0:\n+                    timeout_sec = 30\n+                t.join(timeout_sec)\n+                if t.is_alive():\n+                    display.warning(\"WINRM RECEIVE timed out while recovering from stdin send failure; aborting output retrieval\")\n+                    raise AnsibleError('winrm send_input failed; output retrieval timed out')\n+                if result_holder['exc']:\n+                    raise result_holder['exc']\n+                resptuple = result_holder['resptuple']\n+            else:\n+                resptuple = self.protocol.get_command_output(self.shell_id, command_id)\n             # ensure stdout/stderr are text for py3\n             # FUTURE: this should probably be done internally by pywinrm\n             response = Response(tuple(to_text(v) if isinstance(v, binary_type) else v for v in resptuple))\n"
+}

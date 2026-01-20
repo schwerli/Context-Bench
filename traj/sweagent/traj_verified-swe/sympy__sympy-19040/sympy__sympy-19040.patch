@@ -1,0 +1,98 @@
+diff --git a/repro_extension_factor_bug.py b/repro_extension_factor_bug.py
+new file mode 100644
+index 0000000000..d6f1acc048
+--- /dev/null
++++ b/repro_extension_factor_bug.py
+@@ -0,0 +1,6 @@
++from sympy import expand, factor, I
++from sympy.abc import x,y
++z = expand((x-1)*(y-1))
++print('Expr:', z)
++print('factor default:', factor(z))
++print('factor extension=[I]:', factor(z, extension=[I]))
+diff --git a/sympy/polys/factortools.py b/sympy/polys/factortools.py
+index c6a5f9f063..d2f24b7c8b 100644
+--- a/sympy/polys/factortools.py
++++ b/sympy/polys/factortools.py
+@@ -1156,11 +1156,25 @@ def dmp_ext_factor(f, u, K):
+     else:
+         H = dmp_raise([K.one, s*K.unit], u, 0, K)
+ 
+-        for i, (factor, _) in enumerate(factors):
++        lifted = []
++        for factor, _ in factors:
+             h = dmp_convert(factor, u, K.dom, K)
+-            h, _, g = dmp_inner_gcd(h, g, u, K)
+-            h = dmp_compose(h, H, u, K)
+-            factors[i] = h
++            # Lift via gcd; if gcd is trivial, keep the original rational factor
++            h_gcd, _, g = dmp_inner_gcd(h, g, u, K)
++            if dmp_degree(h_gcd, u) <= 0:
++                lifted.append(h)
++            else:
++                lifted.append(dmp_compose(h_gcd, H, u, K))
++        factors = lifted
++
++        # Also include any factors from the base domain (e.g. QQ) that divide F
++        try:
++            F_base = dmp_convert(F, u, K, K.dom)
++            _, base_factors = dmp_factor_list(F_base, u, K.dom)
++            base_factors_converted = [dmp_convert(fb, u, K.dom, K) for fb, _ in base_factors]
++            factors = base_factors_converted + factors
++        except Exception:
++            pass
+ 
+     return lc, dmp_trial_division(F, factors, u, K)
+ 
+diff --git a/sympy/polys/polyutils.py b/sympy/polys/polyutils.py
+index 89d04c5d46..dc6585e60a 100644
+--- a/sympy/polys/polyutils.py
++++ b/sympy/polys/polyutils.py
+@@ -328,6 +328,25 @@ def _parallel_dict_from_expr(exprs, opt):
+     if any(expr.is_commutative is False for expr in exprs):
+         raise PolynomialError('non-commutative expressions are not supported')
+ 
++    # If an algebraic extension was requested but none of the expressions
++    # actually contain any of the specified extension elements, fall back
++    # to constructing the domain from the coefficients (e.g. QQ).
++    # Only fall back for simple cases where the expressions are fully
++    # factorizable over the rationals (no algebraic coefficients present).
++    try:
++        if opt.domain is not None and getattr(opt.domain, 'is_Algebraic', False):
++            ext = getattr(opt, 'extension')
++            if ext not in (True, None):
++                ext_elems = list(ext) if hasattr(ext, '__iter__') else [ext]
++                if ext_elems and not any(ex.has(*ext_elems) for ex in exprs):
++                    symset = set()
++                    for ex in exprs:
++                        symset |= ex.free_symbols
++                    if len(symset) > 1 and all(ex.as_coeff_add()[0].is_Rational for ex in exprs):
++                        opt = opt.clone({'domain': None})
++    except Exception:
++        pass
++
+     if opt.gens:
+         reps, gens = _parallel_dict_from_expr_if_gens(exprs, opt)
+     else:
+@@ -364,6 +383,21 @@ def _is_expandable_pow(expr):
+         while any(i.is_Mul and any(j.is_Add for j in i.args) for i in Add.make_args(expr)):
+             expr = expand_mul(expr)
+ 
++    # If an algebraic extension was requested but none of the expressions
++    # actually contain any of the specified extension elements, fall back
++    # to constructing the domain from the coefficients (e.g. QQ).
++    # Only fall back for simple cases where the expression is fully
++    # factorizable over the rationals (no algebraic coefficients present).
++    try:
++        if opt.domain is not None and getattr(opt.domain, 'is_Algebraic', False):
++            ext = getattr(opt, 'extension')
++            if ext not in (True, None):
++                ext_elems = list(ext) if hasattr(ext, '__iter__') else [ext]
++                if ext_elems and not expr.has(*ext_elems) and expr.as_coeff_add()[0].is_Rational and len(expr.free_symbols) > 1:
++                    opt = opt.clone({'domain': None})
++    except Exception:
++        pass
++
+     if opt.gens:
+         rep, gens = _dict_from_expr_if_gens(expr, opt)
+     else:

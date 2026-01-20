@@ -1,0 +1,101 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 844c01e95e..f2f5fa7d00 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -804,9 +804,16 @@ class Model(metaclass=ModelBase):
+         inserted = False
+         for parent, field in meta.parents.items():
+             # Make sure the link fields are synced between parent and self.
+-            if (field and getattr(self, parent._meta.pk.attname) is None and
++            if (field and self._state.adding and getattr(self, parent._meta.pk.attname) is None and
+                     getattr(self, field.attname) is not None):
+                 setattr(self, parent._meta.pk.attname, getattr(self, field.attname))
++            if (field and not self._state.adding and
++                    getattr(self, parent._meta.pk.attname) is None and
++                    getattr(self, field.attname) is not None):
++                # Primary key was explicitly reset; ensure a new parent row is created
++                # by clearing the parent_link field so that an INSERT happens.
++                setattr(self, field.attname, None)
++
+             parent_inserted = self._save_parents(cls=parent, using=using, update_fields=update_fields)
+             updated = self._save_table(
+                 cls=parent, using=using, update_fields=update_fields,
+diff --git a/reproduce_pk_reset.py b/reproduce_pk_reset.py
+new file mode 100644
+index 0000000000..d5aca11e3d
+--- /dev/null
++++ b/reproduce_pk_reset.py
+@@ -0,0 +1,73 @@
++import sys
++import os
++
++# Ensure we import the local Django from /testbed
++repo_root = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, repo_root)
++
++from django.conf import settings
++
++# Minimal settings
++settings.configure(
++    DEBUG=True,
++    SECRET_KEY='test',
++    INSTALLED_APPS=[],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    USE_TZ=False,
++)
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.test import TestCase
++
++class Item(models.Model):
++    uid = models.AutoField(primary_key=True, editable=False)
++    f = models.BooleanField(default=False)
++
++    class Meta:
++        app_label = 'pkresetapp'
++
++    def reset(self):
++        self.uid = None
++        self.f = False
++
++class Derived(Item):
++    class Meta:
++        app_label = 'pkresetapp'
++
++# Create the tables
++with connection.schema_editor() as schema:
++    schema.create_model(Item)
++    schema.create_model(Derived)
++
++# Reproduce behaviour
++print('Creating initial Derived with f=True...')
++derv = Derived.objects.create(f=True)
++print('Initial pk:', derv.pk)
++
++item = Item.objects.get(pk=derv.pk)
++obj1 = item.derived
++print('Derived fetched via parent relation, pk:', obj1.pk)
++print('Resetting pk to None and f=False, then saving...')
++obj1.reset()
++obj1.save()
++
++obj_after = Item.objects.get(pk=derv.pk)
++print('After save, Item at original pk has f=', obj_after.f)
++
++# The desired behaviour is that resetting pk to None causes insertion of a new row,
++# thus the original object should remain unchanged with f=True.
++print('Expected: True')
++print('Actual:', obj_after.f)
++
++if obj_after.f is not True:
++    raise SystemExit('BUG: Original object was overwritten (f became False).')
++else:
++    print('OK: Original object preserved. New object inserted with new pk:', Derived.objects.latest('pk').pk)

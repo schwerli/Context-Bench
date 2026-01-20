@@ -1,0 +1,764 @@
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index 494890cc23..cb3ca9a3e2 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -220,6 +220,8 @@ class HashedFilesMixin:
+ 
+         # where to store the new paths
+         hashed_files = {}
++        # collect final results per original file to avoid duplicate yields
++        results = {}
+ 
+         # build a list of adjustable files
+         adjustable_paths = [
+@@ -227,27 +229,52 @@ class HashedFilesMixin:
+             if matches_patterns(path, self._patterns)
+         ]
+         # Do a single pass first. Post-process all files once, then repeat for
+-        # adjustable files.
++        # adjustable files. Aggregate results instead of yielding immediately to
++        # avoid emitting intermediate states for the same original file.
+         for name, hashed_name, processed, _ in self._post_process(paths, adjustable_paths, hashed_files):
+-            yield name, hashed_name, processed
++            if isinstance(processed, Exception):
++                # Propagate errors immediately.
++                yield name, hashed_name, processed
++            else:
++                prev = results.get(name)
++                # Mark as processed if any pass performed processing for this file.
++                aggregated_processed = processed or (prev[1] if prev else False)
++                results[name] = (hashed_name, aggregated_processed)
+ 
++        # Narrow to adjustable paths for subsequent passes.
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
++        # Track if the maximum number of passes was exceeded without reaching a
++        # substitutions-free pass.
++        exceeded_max_passes = True
+         for i in range(self.max_post_process_passes):
+-            substitutions = False
++            any_substitutions = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+-                yield name, hashed_name, processed
+-                substitutions = substitutions or subst
++                if isinstance(processed, Exception):
++                    # Propagate errors immediately.
++                    yield name, hashed_name, processed
++                else:
++                    prev = results.get(name)
++                    aggregated_processed = processed or (prev[1] if prev else False)
++                    results[name] = (hashed_name, aggregated_processed)
++                any_substitutions = any_substitutions or subst
+ 
+-            if not substitutions:
++            if not any_substitutions:
++                exceeded_max_passes = False
+                 break
+ 
+-        if substitutions:
++        if exceeded_max_passes:
++            # Yield an error to match existing behavior when max passes are exceeded.
+             yield 'All', None, RuntimeError('Max post-process passes exceeded.')
+ 
+         # Store the processed paths
+         self.hashed_files.update(hashed_files)
+ 
++        # Finally, yield each original file once with its final hashed name and
++        # whether it was processed at any point.
++        for name, (hashed_name, processed) in results.items():
++            yield name, hashed_name, processed
++
+     def _post_process(self, paths, adjustable_paths, hashed_files):
+         # Sort the files by directory level
+         def path_level(name):
+diff --git a/repro_faulty_postprocess.py b/repro_faulty_postprocess.py
+new file mode 100644
+index 0000000000..54b679d526
+--- /dev/null
++++ b/repro_faulty_postprocess.py
+@@ -0,0 +1,28 @@
++import os, sys
++from io import StringIO
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tests'))
++
++from django.conf import settings
++from django.core.management import call_command
++from django import setup as django_setup
++
++from staticfiles_tests.settings import TEST_SETTINGS, TEST_ROOT
++
++cfg = dict(TEST_SETTINGS)
++cfg['STATICFILES_STORAGE'] = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++cfg['STATICFILES_DIRS'] = [os.path.join(TEST_ROOT, 'project', 'faulty')]
++cfg['STATICFILES_FINDERS'] = ['django.contrib.staticfiles.finders.FileSystemFinder']
++settings.configure(**cfg)
++django_setup()
++
++stdout = StringIO(); stderr = StringIO()
++try:
++    call_command('collectstatic', interactive=False, verbosity=2, stdout=stdout, stderr=stderr, post_process=True)
++    print('collectstatic succeeded unexpectedly')
++except Exception as e:
++    print('Caught Exception:', type(e).__name__, e)
++print('STDERR:')
++print(stderr.getvalue())
++print('STDOUT:')
++print(stdout.getvalue())
+diff --git a/repro_import_loop.py b/repro_import_loop.py
+new file mode 100644
+index 0000000000..02c7416650
+--- /dev/null
++++ b/repro_import_loop.py
+@@ -0,0 +1,30 @@
++import os, sys
++from io import StringIO
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tests'))
++
++from django.conf import settings
++from django.core.management import call_command
++from django import setup as django_setup
++from django.test import override_settings
++
++from staticfiles_tests.settings import TEST_SETTINGS
++
++cfg = dict(TEST_SETTINGS)
++cfg['STATICFILES_STORAGE'] = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++from staticfiles_tests.settings import TEST_ROOT
++cfg['STATICFILES_DIRS'] = [os.path.join(TEST_ROOT, 'project', 'loop')]
++cfg['STATICFILES_FINDERS'] = ['django.contrib.staticfiles.finders.FileSystemFinder']
++settings.configure(**cfg)
++django_setup()
++
++stdout = StringIO(); stderr = StringIO()
++try:
++    call_command('collectstatic', interactive=False, verbosity=2, stdout=stdout, stderr=stderr, post_process=True)
++    print('collectstatic succeeded unexpectedly')
++except RuntimeError as e:
++    print('Caught RuntimeError:', e)
++print('STDERR:')
++print(stderr.getvalue())
++print('STDOUT:')
++print(stdout.getvalue())
+diff --git a/repro_staticfiles_yield.py b/repro_staticfiles_yield.py
+new file mode 100644
+index 0000000000..b5ceae0848
+--- /dev/null
++++ b/repro_staticfiles_yield.py
+@@ -0,0 +1,62 @@
++import os, sys
++from io import StringIO
++from collections import defaultdict
++
++# Ensure tests package is importable
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tests'))
++
++from django.conf import settings
++from django.core.management import call_command
++from django import setup as django_setup
++
++from staticfiles_tests.settings import TEST_SETTINGS
++
++# Configure settings
++cfg = dict(TEST_SETTINGS)
++cfg['STATICFILES_STORAGE'] = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
++# Make sure STATIC_ROOT exists and is empty
++static_root = cfg['STATIC_ROOT']
++os.makedirs(static_root, exist_ok=True)
++# Clear STATIC_ROOT content
++for root, dirs, files in os.walk(static_root):
++    for f in files:
++        try:
++            os.remove(os.path.join(root, f))
++        except FileNotFoundError:
++            pass
++    for d in dirs:
++        try:
++            os.rmdir(os.path.join(root, d))
++        except OSError:
++            pass
++
++settings.configure(**cfg)
++django_setup()
++
++# Run collectstatic and capture output
++stdout = StringIO()
++stderr = StringIO()
++call_command('collectstatic', interactive=False, verbosity=2, stdout=stdout, stderr=stderr, post_process=True)
++
++out = stdout.getvalue()
++print(out)
++
++# Analyze 'Post-processed' lines for duplicates
++counts = defaultdict(int)
++for line in out.splitlines():
++    line = line.strip()
++    if line.startswith("Post-processed '"):
++        # Extract original path inside quotes
++        try:
++            orig = line.split("'")[1]
++        except Exception:
++            continue
++        counts[orig] += 1
++
++print("\nDuplicate yield report:")
++for orig, cnt in sorted(counts.items()):
++    if cnt > 1:
++        print(f"{orig}: yielded {cnt} times")
++    else:
++        print(f"{orig}: yielded once")
++
+diff --git a/tests/staticfiles_tests/project/site_media/static/absolute_root.css b/tests/staticfiles_tests/project/site_media/static/absolute_root.css
+new file mode 100644
+index 0000000000..b35ff47c9e
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/absolute_root.css
+@@ -0,0 +1 @@
++@import url("/static/styles_root.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/absolute_root.f821df1b64f7.css b/tests/staticfiles_tests/project/site_media/static/absolute_root.f821df1b64f7.css
+new file mode 100644
+index 0000000000..2d40dc386f
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/absolute_root.f821df1b64f7.css
+@@ -0,0 +1 @@
++@import url("/static/styles_root.401f2509a628.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/bar.365163d2ac9a.css b/tests/staticfiles_tests/project/site_media/static/bar.365163d2ac9a.css
+new file mode 100644
+index 0000000000..f549b1c067
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/bar.365163d2ac9a.css
+@@ -0,0 +1 @@
++@import url("foo.c78f831dd30d.css")
+diff --git a/tests/staticfiles_tests/project/site_media/static/bar.css b/tests/staticfiles_tests/project/site_media/static/bar.css
+new file mode 100644
+index 0000000000..1f11a22cbf
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/bar.css
+@@ -0,0 +1 @@
++@import url("foo.css")
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/absolute.css b/tests/staticfiles_tests/project/site_media/static/cached/absolute.css
+new file mode 100644
+index 0000000000..6a2040b413
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/absolute.css
+@@ -0,0 +1,5 @@
++@import url("/static/cached/styles.css");
++@import url("/static/styles_root.css");
++body {
++    background: #d3d6d8 url(/static/cached/img/relative.png);
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/absolute.eb04def9f9a4.css b/tests/staticfiles_tests/project/site_media/static/cached/absolute.eb04def9f9a4.css
+new file mode 100644
+index 0000000000..b34c683486
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/absolute.eb04def9f9a4.css
+@@ -0,0 +1,5 @@
++@import url("/static/cached/styles.5e0040571e1a.css");
++@import url("/static/styles_root.401f2509a628.css");
++body {
++    background: #d3d6d8 url("/static/cached/img/relative.acae32e4532b.png");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b8d603e42714.svg b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b8d603e42714.svg
+new file mode 100644
+index 0000000000..0282375915
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b8d603e42714.svg
+@@ -0,0 +1 @@
++not really a SVG ;)
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b9b105392eb8.eot b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b9b105392eb8.eot
+new file mode 100644
+index 0000000000..fdd7138c52
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.b9b105392eb8.eot
+@@ -0,0 +1 @@
++not really an EOT ;)
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.eot b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.eot
+new file mode 100644
+index 0000000000..fdd7138c52
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.eot
+@@ -0,0 +1 @@
++not really an EOT ;)
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.svg b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.svg
+new file mode 100644
+index 0000000000..0282375915
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fonts/font.svg
+@@ -0,0 +1 @@
++not really a SVG ;)
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.a60c0e74834f.css b/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.a60c0e74834f.css
+new file mode 100644
+index 0000000000..a7eddd8554
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.a60c0e74834f.css
+@@ -0,0 +1,9 @@
++@font-face {
++    src: url("fonts/font.b9b105392eb8.eot?#iefix") format('embedded-opentype'),
++         url("fonts/font.b8d603e42714.svg#webfontIyfZbseF") format('svg');
++         url("fonts/font.b8d603e42714.svg#path/to/../../fonts/font.svg") format('svg');
++         url('data:font/woff;charset=utf-8;base64,d09GRgABAAAAADJoAA0AAAAAR2QAAQAAAAAAAAAAAAA');
++}
++div {
++    behavior: url("#default#VML");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.css b/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.css
+new file mode 100644
+index 0000000000..533d7617aa
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/fragments.css
+@@ -0,0 +1,9 @@
++@font-face {
++    src: url('fonts/font.eot?#iefix') format('embedded-opentype'),
++         url('fonts/font.svg#webfontIyfZbseF') format('svg');
++         url('fonts/font.svg#path/to/../../fonts/font.svg') format('svg');
++         url('data:font/woff;charset=utf-8;base64,d09GRgABAAAAADJoAA0AAAAAR2QAAQAAAAAAAAAAAAA');
++}
++div {
++    behavior: url("#default#VML");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.554da52152af.css b/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.554da52152af.css
+new file mode 100644
+index 0000000000..83b1d5ebf8
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.554da52152af.css
+@@ -0,0 +1,9 @@
++body {
++    background: url("#foobar");
++    background: url("http:foobar");
++    background: url("https:foobar");
++    background: url("data:foobar");
++    background: url("chrome:foobar");
++    background: url("//foobar");
++}
++
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.css b/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.css
+new file mode 100644
+index 0000000000..83b1d5ebf8
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/ignored.css
+@@ -0,0 +1,9 @@
++body {
++    background: url("#foobar");
++    background: url("http:foobar");
++    background: url("https:foobar");
++    background: url("data:foobar");
++    background: url("chrome:foobar");
++    background: url("//foobar");
++}
++
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.acae32e4532b.png b/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.acae32e4532b.png
+new file mode 100644
+index 0000000000..ba48325c0a
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.acae32e4532b.png differ
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.png b/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.png
+new file mode 100644
+index 0000000000..ba48325c0a
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/cached/css/img/window.png differ
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/window.5d5c10836967.css b/tests/staticfiles_tests/project/site_media/static/cached/css/window.5d5c10836967.css
+new file mode 100644
+index 0000000000..6121708ce2
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/window.5d5c10836967.css
+@@ -0,0 +1,3 @@
++body {
++    background: #d3d6d8 url("img/window.acae32e4532b.png");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/css/window.css b/tests/staticfiles_tests/project/site_media/static/cached/css/window.css
+new file mode 100644
+index 0000000000..770e4001e6
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/css/window.css
+@@ -0,0 +1,3 @@
++body {
++    background: #d3d6d8 url("img/window.png");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/img/relative.acae32e4532b.png b/tests/staticfiles_tests/project/site_media/static/cached/img/relative.acae32e4532b.png
+new file mode 100644
+index 0000000000..ba48325c0a
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/cached/img/relative.acae32e4532b.png differ
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/img/relative.png b/tests/staticfiles_tests/project/site_media/static/cached/img/relative.png
+new file mode 100644
+index 0000000000..ba48325c0a
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/cached/img/relative.png differ
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/import.css b/tests/staticfiles_tests/project/site_media/static/cached/import.css
+new file mode 100644
+index 0000000000..6bc7ce04c4
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/import.css
+@@ -0,0 +1 @@
++@import 'styles.css';
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/import.f53576679e5a.css b/tests/staticfiles_tests/project/site_media/static/cached/import.f53576679e5a.css
+new file mode 100644
+index 0000000000..233fc72c6a
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/import.f53576679e5a.css
+@@ -0,0 +1 @@
++@import url("styles.5e0040571e1a.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/other.css b/tests/staticfiles_tests/project/site_media/static/cached/other.css
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/other.d41d8cd98f00.css b/tests/staticfiles_tests/project/site_media/static/cached/other.d41d8cd98f00.css
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/relative.c3e9e1ea6f2e.css b/tests/staticfiles_tests/project/site_media/static/cached/relative.c3e9e1ea6f2e.css
+new file mode 100644
+index 0000000000..feee5022d6
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/relative.c3e9e1ea6f2e.css
+@@ -0,0 +1,6 @@
++@import url("../cached/styles.5e0040571e1a.css");
++@import url("absolute.eb04def9f9a4.css");
++@import url("absolute.eb04def9f9a4.css#eggs");
++body {
++    background: #d3d6d8 url("img/relative.acae32e4532b.png");
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/relative.css b/tests/staticfiles_tests/project/site_media/static/cached/relative.css
+new file mode 100644
+index 0000000000..68995c4fed
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/relative.css
+@@ -0,0 +1,6 @@
++@import url("../cached/styles.css");
++@import url("absolute.css");
++@import url("absolute.css#eggs");
++body {
++    background: #d3d6d8 url(img/relative.png);
++}
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/styles.5e0040571e1a.css b/tests/staticfiles_tests/project/site_media/static/cached/styles.5e0040571e1a.css
+new file mode 100644
+index 0000000000..78239846fd
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/styles.5e0040571e1a.css
+@@ -0,0 +1 @@
++@import url("other.d41d8cd98f00.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/styles.css b/tests/staticfiles_tests/project/site_media/static/cached/styles.css
+new file mode 100644
+index 0000000000..68896f4973
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/styles.css
+@@ -0,0 +1 @@
++@import url("other.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.3fa427592a53.css b/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.3fa427592a53.css
+new file mode 100644
+index 0000000000..d2fe21a6f6
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.3fa427592a53.css
+@@ -0,0 +1 @@
++@IMporT url("other.d41d8cd98f00.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.css b/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.css
+new file mode 100644
+index 0000000000..3cd3d08349
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/styles_insensitive.css
+@@ -0,0 +1 @@
++@IMporT uRL("other.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/test.62789ffcd280.js b/tests/staticfiles_tests/project/site_media/static/cached/test.62789ffcd280.js
+new file mode 100644
+index 0000000000..3d1c431aff
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/test.62789ffcd280.js
+@@ -0,0 +1 @@
++myVar = url("import.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/test.js b/tests/staticfiles_tests/project/site_media/static/cached/test.js
+new file mode 100644
+index 0000000000..3d1c431aff
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/test.js
+@@ -0,0 +1 @@
++myVar = url("import.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/url.902310b73412.css b/tests/staticfiles_tests/project/site_media/static/cached/url.902310b73412.css
+new file mode 100644
+index 0000000000..c0974475ca
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/url.902310b73412.css
+@@ -0,0 +1 @@
++@import url("https://www.djangoproject.com/m/css/base.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/cached/url.css b/tests/staticfiles_tests/project/site_media/static/cached/url.css
+new file mode 100644
+index 0000000000..c0974475ca
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/cached/url.css
+@@ -0,0 +1 @@
++@import url("https://www.djangoproject.com/m/css/base.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/faulty.css b/tests/staticfiles_tests/project/site_media/static/faulty.css
+new file mode 100644
+index 0000000000..ca57c77e55
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/faulty.css
+@@ -0,0 +1 @@
++@import url("missing.css");
+diff --git a/tests/staticfiles_tests/project/site_media/static/file2.ae652b5c514c.txt b/tests/staticfiles_tests/project/site_media/static/file2.ae652b5c514c.txt
+new file mode 100644
+index 0000000000..aa264cab9b
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/file2.ae652b5c514c.txt
+@@ -0,0 +1 @@
++file2 in no_label_app
+diff --git a/tests/staticfiles_tests/project/site_media/static/file2.txt b/tests/staticfiles_tests/project/site_media/static/file2.txt
+new file mode 100644
+index 0000000000..aa264cab9b
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/file2.txt
+@@ -0,0 +1 @@
++file2 in no_label_app
+diff --git a/tests/staticfiles_tests/project/site_media/static/foo.css b/tests/staticfiles_tests/project/site_media/static/foo.css
+new file mode 100644
+index 0000000000..0903a70802
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/foo.css
+@@ -0,0 +1 @@
++@import url("bar.css")
+diff --git a/tests/staticfiles_tests/project/site_media/static/foo.f45de2081854.css b/tests/staticfiles_tests/project/site_media/static/foo.f45de2081854.css
+new file mode 100644
+index 0000000000..03619fef05
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/foo.f45de2081854.css
+@@ -0,0 +1 @@
++@import url("bar.365163d2ac9a.css")
+diff --git a/tests/staticfiles_tests/project/site_media/static/media-file.65b17f937dfa.txt b/tests/staticfiles_tests/project/site_media/static/media-file.65b17f937dfa.txt
+new file mode 100644
+index 0000000000..466922d07a
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/media-file.65b17f937dfa.txt
+@@ -0,0 +1 @@
++Media file.
+diff --git a/tests/staticfiles_tests/project/site_media/static/media-file.txt b/tests/staticfiles_tests/project/site_media/static/media-file.txt
+new file mode 100644
+index 0000000000..466922d07a
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/media-file.txt
+@@ -0,0 +1 @@
++Media file.
+diff --git a/tests/staticfiles_tests/project/site_media/static/nested/css/base.b595a74e1f56.css b/tests/staticfiles_tests/project/site_media/static/nested/css/base.b595a74e1f56.css
+new file mode 100644
+index 0000000000..06041ca25f
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/nested/css/base.b595a74e1f56.css
+@@ -0,0 +1 @@
++html {height: 100%;}
+diff --git a/tests/staticfiles_tests/project/site_media/static/nested/css/base.css b/tests/staticfiles_tests/project/site_media/static/nested/css/base.css
+new file mode 100644
+index 0000000000..06041ca25f
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/nested/css/base.css
+@@ -0,0 +1 @@
++html {height: 100%;}
+diff --git a/tests/staticfiles_tests/project/site_media/static/pathlib.df92d5f4684d.txt b/tests/staticfiles_tests/project/site_media/static/pathlib.df92d5f4684d.txt
+new file mode 100644
+index 0000000000..c7709d3d41
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/pathlib.df92d5f4684d.txt
+@@ -0,0 +1 @@
++pathlib
+diff --git a/tests/staticfiles_tests/project/site_media/static/pathlib.txt b/tests/staticfiles_tests/project/site_media/static/pathlib.txt
+new file mode 100644
+index 0000000000..c7709d3d41
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/pathlib.txt
+@@ -0,0 +1 @@
++pathlib
+diff --git a/tests/staticfiles_tests/project/site_media/static/prefix/test.131f0ab129ae.txt b/tests/staticfiles_tests/project/site_media/static/prefix/test.131f0ab129ae.txt
+new file mode 100644
+index 0000000000..d3a017895c
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/prefix/test.131f0ab129ae.txt
+@@ -0,0 +1 @@
++Prefix!
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/prefix/test.txt b/tests/staticfiles_tests/project/site_media/static/prefix/test.txt
+new file mode 100644
+index 0000000000..d3a017895c
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/prefix/test.txt
+@@ -0,0 +1 @@
++Prefix!
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/staticfiles.json b/tests/staticfiles_tests/project/site_media/static/staticfiles.json
+new file mode 100644
+index 0000000000..121c5f12b6
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/staticfiles.json
+@@ -0,0 +1 @@
++{"paths": {"cached/css/fonts/font.eot": "cached/css/fonts/font.b9b105392eb8.eot", "cached/css/fonts/font.svg": "cached/css/fonts/font.b8d603e42714.svg", "cached/css/img/window.png": "cached/css/img/window.acae32e4532b.png", "nested/css/base.css": "nested/css/base.b595a74e1f56.css", "cached/css/window.css": "cached/css/window.5d5c10836967.css", "cached/css/ignored.css": "cached/css/ignored.554da52152af.css", "cached/css/fragments.css": "cached/css/fragments.a60c0e74834f.css", "cached/img/relative.png": "cached/img/relative.acae32e4532b.png", "test/vendor/module.js": "test/vendor/module.d41d8cd98f00.js", "test/file.txt": "test/file.dad0999e4f8f.txt", "test/camelCase.txt": "test/camelCase.dcc960fbf12d.txt", "subdir/test.txt": "subdir/test.b3eff404e5bb.txt", "cached/test.js": "cached/test.62789ffcd280.js", "cached/other.css": "cached/other.d41d8cd98f00.css", "cached/absolute.css": "cached/absolute.eb04def9f9a4.css", "cached/styles_insensitive.css": "cached/styles_insensitive.3fa427592a53.css", "cached/relative.css": "cached/relative.c3e9e1ea6f2e.css", "cached/import.css": "cached/import.f53576679e5a.css", "cached/url.css": "cached/url.902310b73412.css", "cached/styles.css": "cached/styles.5e0040571e1a.css", "prefix/test.txt": "prefix/test.131f0ab129ae.txt", "test/test.ignoreme": "test/test.a88291139d77.ignoreme", "test/%2F.txt": "test/.txt.fd1cb434fc14", "test/nonascii.css": "test/nonascii.a5155db9d7cc.css", "test/window.png": "test/window.9224bd75b323.png", "test/file1.txt": "test/file1.6c0403df55de.txt", "test/\u2297.txt": "test/\u2297.8a3dda0dff20.txt", "test.txt": "test.b3eff404e5bb.txt", "absolute_root.css": "absolute_root.f821df1b64f7.css", "styles_root.css": "styles_root.401f2509a628.css", "pathlib.txt": "pathlib.df92d5f4684d.txt", "file2.txt": "file2.ae652b5c514c.txt", "media-file.txt": "media-file.65b17f937dfa.txt"}, "version": "1.0"}
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/styles_root.401f2509a628.css b/tests/staticfiles_tests/project/site_media/static/styles_root.401f2509a628.css
+new file mode 100644
+index 0000000000..64512630cb
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/styles_root.401f2509a628.css
+@@ -0,0 +1 @@
++/* see cached/absolute.css and absolute_root.css */
+diff --git a/tests/staticfiles_tests/project/site_media/static/styles_root.css b/tests/staticfiles_tests/project/site_media/static/styles_root.css
+new file mode 100644
+index 0000000000..64512630cb
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/styles_root.css
+@@ -0,0 +1 @@
++/* see cached/absolute.css and absolute_root.css */
+diff --git a/tests/staticfiles_tests/project/site_media/static/subdir/test.b3eff404e5bb.txt b/tests/staticfiles_tests/project/site_media/static/subdir/test.b3eff404e5bb.txt
+new file mode 100644
+index 0000000000..04326a212d
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/subdir/test.b3eff404e5bb.txt
+@@ -0,0 +1 @@
++Can we find this file?
+diff --git a/tests/staticfiles_tests/project/site_media/static/subdir/test.txt b/tests/staticfiles_tests/project/site_media/static/subdir/test.txt
+new file mode 100644
+index 0000000000..04326a212d
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/subdir/test.txt
+@@ -0,0 +1 @@
++Can we find this file?
+diff --git a/tests/staticfiles_tests/project/site_media/static/test.b3eff404e5bb.txt b/tests/staticfiles_tests/project/site_media/static/test.b3eff404e5bb.txt
+new file mode 100644
+index 0000000000..04326a212d
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test.b3eff404e5bb.txt
+@@ -0,0 +1 @@
++Can we find this file?
+diff --git a/tests/staticfiles_tests/project/site_media/static/test.txt b/tests/staticfiles_tests/project/site_media/static/test.txt
+new file mode 100644
+index 0000000000..04326a212d
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test.txt
+@@ -0,0 +1 @@
++Can we find this file?
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/%2F.txt b/tests/staticfiles_tests/project/site_media/static/test/%2F.txt
+new file mode 100644
+index 0000000000..d98b646c7c
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/%2F.txt
+@@ -0,0 +1 @@
++%2F content
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/.txt.fd1cb434fc14 b/tests/staticfiles_tests/project/site_media/static/test/.txt.fd1cb434fc14
+new file mode 100644
+index 0000000000..d98b646c7c
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/.txt.fd1cb434fc14
+@@ -0,0 +1 @@
++%2F content
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/camelCase.dcc960fbf12d.txt b/tests/staticfiles_tests/project/site_media/static/test/camelCase.dcc960fbf12d.txt
+new file mode 100644
+index 0000000000..b4f8882668
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/camelCase.dcc960fbf12d.txt
+@@ -0,0 +1 @@
++This file is named with camelCase.
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/camelCase.txt b/tests/staticfiles_tests/project/site_media/static/test/camelCase.txt
+new file mode 100644
+index 0000000000..b4f8882668
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/camelCase.txt
+@@ -0,0 +1 @@
++This file is named with camelCase.
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/file.dad0999e4f8f.txt b/tests/staticfiles_tests/project/site_media/static/test/file.dad0999e4f8f.txt
+new file mode 100644
+index 0000000000..fdeaa23254
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/file.dad0999e4f8f.txt
+@@ -0,0 +1,2 @@
++In STATICFILES_DIRS directory.
++
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/file.txt b/tests/staticfiles_tests/project/site_media/static/test/file.txt
+new file mode 100644
+index 0000000000..fdeaa23254
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/file.txt
+@@ -0,0 +1,2 @@
++In STATICFILES_DIRS directory.
++
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/file1.6c0403df55de.txt b/tests/staticfiles_tests/project/site_media/static/test/file1.6c0403df55de.txt
+new file mode 100644
+index 0000000000..9f9a8d92ab
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/file1.6c0403df55de.txt
+@@ -0,0 +1 @@
++file1 in the app dir
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/file1.txt b/tests/staticfiles_tests/project/site_media/static/test/file1.txt
+new file mode 100644
+index 0000000000..9f9a8d92ab
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/file1.txt
+@@ -0,0 +1 @@
++file1 in the app dir
+\ No newline at end of file
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/nonascii.a5155db9d7cc.css b/tests/staticfiles_tests/project/site_media/static/test/nonascii.a5155db9d7cc.css
+new file mode 100644
+index 0000000000..c0e40f7061
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/nonascii.a5155db9d7cc.css
+@@ -0,0 +1,5 @@
++body {
++  background: url("window.9224bd75b323.png");
++}
++
++.snowman:before { content: "☃"; }
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/nonascii.css b/tests/staticfiles_tests/project/site_media/static/test/nonascii.css
+new file mode 100644
+index 0000000000..a5358f6ede
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/nonascii.css
+@@ -0,0 +1,5 @@
++body {
++  background: url('window.png');
++}
++
++.snowman:before { content: "☃"; }
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/test.a88291139d77.ignoreme b/tests/staticfiles_tests/project/site_media/static/test/test.a88291139d77.ignoreme
+new file mode 100644
+index 0000000000..cef6c23575
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/test.a88291139d77.ignoreme
+@@ -0,0 +1 @@
++This file should be ignored.
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/test.ignoreme b/tests/staticfiles_tests/project/site_media/static/test/test.ignoreme
+new file mode 100644
+index 0000000000..cef6c23575
+--- /dev/null
++++ b/tests/staticfiles_tests/project/site_media/static/test/test.ignoreme
+@@ -0,0 +1 @@
++This file should be ignored.
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/vendor/module.d41d8cd98f00.js b/tests/staticfiles_tests/project/site_media/static/test/vendor/module.d41d8cd98f00.js
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/vendor/module.js b/tests/staticfiles_tests/project/site_media/static/test/vendor/module.js
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/window.9224bd75b323.png b/tests/staticfiles_tests/project/site_media/static/test/window.9224bd75b323.png
+new file mode 100644
+index 0000000000..89738479c0
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/test/window.9224bd75b323.png differ
+diff --git a/tests/staticfiles_tests/project/site_media/static/test/window.png b/tests/staticfiles_tests/project/site_media/static/test/window.png
+new file mode 100644
+index 0000000000..89738479c0
+Binary files /dev/null and b/tests/staticfiles_tests/project/site_media/static/test/window.png differ
+diff --git "a/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.8a3dda0dff20.txt" "b/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.8a3dda0dff20.txt"
+new file mode 100644
+index 0000000000..598ebdd978
+--- /dev/null
++++ "b/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.8a3dda0dff20.txt"
+@@ -0,0 +1 @@
++⊗ in the app dir
+diff --git "a/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.txt" "b/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.txt"
+new file mode 100644
+index 0000000000..598ebdd978
+--- /dev/null
++++ "b/tests/staticfiles_tests/project/site_media/static/test/\342\212\227.txt"
+@@ -0,0 +1 @@
++⊗ in the app dir
+diff --git a/tests/staticfiles_tests/project/site_media/static/testfile.txt b/tests/staticfiles_tests/project/site_media/static/testfile.txt
+deleted file mode 100644
+index 4d92dbe1ad..0000000000
+--- a/tests/staticfiles_tests/project/site_media/static/testfile.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-Test!
+\ No newline at end of file

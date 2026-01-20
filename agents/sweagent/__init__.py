@@ -1,3 +1,3 @@
-"""SWE-agent extractor - to be implemented."""
-# TODO: Implement SWE-agent trajectory extraction logic
+from .extract import extract_trajectory
 
+__all__ = ['extract_trajectory']

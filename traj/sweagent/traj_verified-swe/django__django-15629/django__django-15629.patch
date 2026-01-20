@@ -1,0 +1,196 @@
+diff --git a/django/db/backends/mysql/schema.py b/django/db/backends/mysql/schema.py
+index 562b209eef..f42dc05c87 100644
+--- a/django/db/backends/mysql/schema.py
++++ b/django/db/backends/mysql/schema.py
+@@ -167,6 +167,25 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+ 
+     def _alter_column_type_sql(self, model, old_field, new_field, new_type):
+         new_type = self._set_field_new_type_null_status(old_field, new_type)
++        # If the field has a collation (e.g., a ForeignKey to a CharField with
++        # db_collation set), include it in the type alteration. This ensures that
++        # referencing columns have the same collation as the referenced primary
++        # key which is required by MySQL for foreign key constraints.
++        new_db_params = new_field.db_parameters(connection=self.connection)
++        collation = new_db_params.get("collation")
++        if collation:
++            return (
++                (
++                    self.sql_alter_column_collate
++                    % {
++                        "column": self.quote_name(new_field.column),
++                        "type": new_type,
++                        "collation": " " + self._collate_sql(collation),
++                    },
++                    [],
++                ),
++                [],
++            )
+         return super()._alter_column_type_sql(model, old_field, new_field, new_type)
+ 
+     def _rename_field_sql(self, table, old_field, new_field, new_type):
+diff --git a/django/db/models/fields/related.py b/django/db/models/fields/related.py
+index fad5560486..b2d30ce481 100644
+--- a/django/db/models/fields/related.py
++++ b/django/db/models/fields/related.py
+@@ -1180,7 +1180,17 @@ class ForeignKey(ForeignObject):
+         return self.target_field.rel_db_type(connection=connection)
+ 
+     def db_parameters(self, connection):
+-        return {"type": self.db_type(connection), "check": self.db_check(connection)}
++        params = {"type": self.db_type(connection), "check": self.db_check(connection)}
++        # Propagate collation from the target field, if any, so that schema
++        # operations on referencing columns can include the same collation.
++        try:
++            target_params = self.target_field.db_parameters(connection)
++        except Exception:
++            target_params = {}
++        collation = target_params.get("collation")
++        if collation is not None:
++            params["collation"] = collation
++        return params
+ 
+     def convert_empty_strings(self, value, expression, connection):
+         if (not value) and isinstance(value, str):
+diff --git a/dummy b/dummy
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/repro_collation_fk.py b/repro_collation_fk.py
+new file mode 100644
+index 0000000000..ca351c6a9b
+--- /dev/null
++++ b/repro_collation_fk.py
+@@ -0,0 +1,134 @@
++import sys
++import django
++from django.conf import settings
++
++def setup_settings():
++    if settings.configured:
++        return
++    settings.configure(
++        INSTALLED_APPS=[],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': 'dummy',
++                'USER': '',
++                'PASSWORD': '',
++                'HOST': '',
++                'PORT': '',
++            }
++        },
++        SECRET_KEY='dummy',
++    )
++    django.setup()
++
++from django.db import models, connections
++
++def define_models():
++    class Account(models.Model):
++        class Meta:
++            app_label = 'testapp'
++    class Address(models.Model):
++        account = models.OneToOneField(Account, on_delete=models.CASCADE)
++        class Meta:
++            app_label = 'testapp'
++    class Profile(models.Model):
++        account = models.ForeignKey(Account, null=True, blank=True, on_delete=models.CASCADE)
++        class Meta:
++            app_label = 'testapp'
++    return Account, Address, Profile
++
++
++def make_fields(Account):
++    # Old primary key: BigAutoField
++    old_pk = models.BigAutoField(primary_key=True)
++    old_pk.set_attributes_from_name('id')
++    old_pk.model = Account
++    # New primary key: CharField with collation
++    new_pk = models.CharField(primary_key=True, max_length=22)
++    # Assign db_collation attribute as per Django's CharField constructor option
++    new_pk.db_collation = 'utf8_bin'
++    new_pk.set_attributes_from_name('id')
++    new_pk.model = Account
++    # Ensure reverse relations exist (already via field definitions above)
++    return old_pk, new_pk
++
++
++def main():
++    setup_settings()
++    # Use MySQL schema editor with a dummy connection so we can collect SQL
++    from django.db.backends.mysql.schema import DatabaseSchemaEditor
++    class DummyOps:
++        def quote_name(self, name):
++            return f"`{name}`"
++    class DummyFeatures:
++        supports_foreign_keys = True
++        supports_combined_alters = True
++        can_rollback_ddl = True
++        interprets_empty_strings_as_nulls = False
++        implied_column_null = False
++        supports_tablespaces = False
++        supports_covering_indexes = False
++        requires_literal_defaults = False
++        connection_persists_old_columns = False
++    class DummyConnection:
++        alias = 'default'
++        features = DummyFeatures()
++        ops = DummyOps()
++        in_atomic_block = False
++        mysql_is_mariadb = False
++        mysql_version = (8, 0, 13)
++        _limited_data_types = set()
++        def cursor(self):
++            class C:
++                def __enter__(self): return self
++                def __exit__(self, *args): pass
++                def execute(self, sql, params=()): pass
++            return C()
++    dummy_conn = DummyConnection()
++    editor = DatabaseSchemaEditor(dummy_conn, collect_sql=True, atomic=False)
++
++    class DummyField:
++        def __init__(self, column, null, collation, type_):
++            self.column = column
++            self.null = null
++            self._collation = collation
++            self._type = type_
++        def db_parameters(self, connection):
++            return {"type": self._type, "check": None, "collation": self._collation}
++
++    with editor:
++        # Simulate PK alteration on Account.id
++        fragment, _ = editor._alter_column_type_sql(None, DummyField('id', False, 'utf8_bin', 'varchar(22)'), DummyField('id', False, 'utf8_bin', 'varchar(22)'), 'varchar(22)')
++        editor.execute(
++            editor.sql_alter_column % {
++                'table': editor.quote_name('b_manage_account'),
++                'changes': fragment[0],
++            },
++            fragment[1],
++        )
++        # Simulate FK column type alteration for Address.account_id and Profile.account_id
++        fk_field = DummyField('account_id', False, 'utf8_bin', 'varchar(22)')
++        fragment, _ = editor._alter_column_type_sql(None, fk_field, fk_field, 'varchar(22)')
++        editor.execute(
++            editor.sql_alter_column % {
++                'table': editor.quote_name('b_manage_address'),
++                'changes': fragment[0],
++            },
++            fragment[1],
++        )
++        fragment, _ = editor._alter_column_type_sql(None, fk_field, fk_field, 'varchar(22)')
++        editor.execute(
++            editor.sql_alter_column % {
++                'table': editor.quote_name('b_manage_profile'),
++                'changes': fragment[0],
++            },
++            fragment[1],
++        )
++    sql = editor.collected_sql
++    print('\n'.join(sql))
++    # Check presence of COLLATE in modifications of fk columns
++    has_fk_collate = any('account_id' in s and 'COLLATE' in s for s in sql)
++    print('\nHas COLLATE on FK column modifications:', has_fk_collate)
++
++if __name__ == '__main__':
++    main()

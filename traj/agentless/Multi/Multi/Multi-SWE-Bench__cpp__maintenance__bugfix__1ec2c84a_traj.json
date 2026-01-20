@@ -1,0 +1,67 @@
+{
+  "instance_id": "Multi-SWE-Bench__cpp__maintenance__bugfix__1ec2c84a",
+  "original_id": "fmtlib__fmt-1663",
+  "1_model_selected_files": [
+    "include/fmt/core.h",
+    "include/fmt/format.h",
+    "include/fmt/format-inl.h",
+    "src/format.cc"
+  ],
+  "2_embedding_selected_files": [],
+  "3_final_combined_files": [
+    "include/fmt/core.h",
+    "include/fmt/format.h",
+    "include/fmt/format-inl.h"
+  ],
+  "4_related_elements": {
+    "include/fmt/core.h": [
+      "class: fmt::dynamic_format_arg_store\nfunction: fmt::dynamic_format_arg_store<Context>::push_back(const T&)\nfunction: fmt::dynamic_format_arg_store<Context>::push_back(std::reference_wrapper<T>)\nfunction: fmt::dynamic_format_arg_store<Context>::get_types\nvariable: fmt::dynamic_format_arg_store<Context>::data_\nfunction: fmt::basic_format_args<Context>::basic_format_args(const dynamic_format_arg_store<Context>&)\nfunction: fmt::basic_format_args<Context>::get(basic_string_view<Char>)\nvariable: fmt::internal::has_named_args_bit\nclass: fmt::internal::named_arg_info\nfunction: fmt::basic_format_arg<Context>::basic_format_arg(const fmt::internal::named_arg_info<char_type>*, size_t)"
+    ],
+    "include/fmt/format.h": [
+      ""
+    ],
+    "include/fmt/format-inl.h": [
+      ""
+    ]
+  },
+  "5_sampled_edit_locs_and_patches": [
+    {
+      "sample_index": 0,
+      "edit_locs": {
+        "include/fmt/core.h": [
+          "class: basic_format_arg<Context>\nline: 1599\nline: 1600\nclass: dynamic_format_arg_store<Context>\nfunction: dynamic_format_arg_store.get_types\nfunction: dynamic_format_arg_store.data\nfunction: dynamic_format_arg_store.push_back"
+        ],
+        "include/fmt/format.h": [
+          ""
+        ],
+        "include/fmt/format-inl.h": [
+          ""
+        ]
+      },
+      "patches": [
+        "diff --git a/include/fmt/core.h b/include/fmt/core.h\nindex 1563a41..78ddd33 100644\n--- a/include/fmt/core.h\n+++ b/include/fmt/core.h\n@@ -1597,7 +1597,7 @@ template <typename Context> class basic_format_args {\n    \\endrst\n    */\n   FMT_INLINE basic_format_args(const dynamic_format_arg_store<Context>& store)\n-      : basic_format_args(store.get_types(), store.data_.data()) {}\n+      : basic_format_args(store.desc, store.data_.args()) {}\n \n   /**\n    \\rst\n",
+        "diff --git a/include/fmt/core.h b/include/fmt/core.h\nindex 1563a41..843ea35 100644\n--- a/include/fmt/core.h\n+++ b/include/fmt/core.h\n@@ -1,3 +1,4 @@\n+\n // Formatting library for C++ - the core API\n //\n // Copyright (c) 2012 - present, Victor Zverovich\n@@ -1131,6 +1132,7 @@ template <typename Context> class basic_format_arg {\n \n   friend class basic_format_args<Context>;\n   friend class internal::arg_map<Context>;\n+  template <typename Ctx> friend class dynamic_format_arg_store;\n \n   using char_type = typename Context::char_type;\n \n@@ -1465,14 +1467,49 @@ class dynamic_format_arg_store\n   // without relocation because items in data_ refer to it.\n   internal::dynamic_arg_list dynamic_args_;\n \n+  // Storage for named argument metadata.\n+  std::vector<internal::named_arg_info<char_type>> named_info_;\n+  bool has_named_args_ = false;\n+\n   friend class basic_format_args<Context>;\n \n+  // Number of real (non-sentinel) arguments.\n+  std::size_t count_args() const {\n+    return has_named_args_ ? (data_.size() > 0 ? data_.size() - 1 : 0)\n+                           : data_.size();\n+  }\n+\n   unsigned long long get_types() const {\n-    return internal::is_unpacked_bit | data_.size();\n+    return internal::is_unpacked_bit | internal::to_unsigned(count_args()) |\n+           (has_named_args_ ? internal::has_named_args_bit : 0);\n+  }\n+\n+  // Pointer to the first real argument for basic_format_args.\n+  const basic_format_arg<Context>* data() const {\n+    if (has_named_args_) {\n+      return count_args() ? &data_[1] : nullptr;\n+    }\n+    return count_args() ? &data_[0] : nullptr;\n+  }\n+\n+  // Ensures the sentinel containing named args metadata is present and up to date.\n+  void update_sentinel() {\n+    if (!has_named_args_) return;\n+    basic_format_arg<Context> sentinel(named_info_.data(), named_info_.size());\n+    if (data_.empty()) {\n+      data_.push_back(sentinel);\n+    } else {\n+      data_[0] = sentinel;\n+    }\n   }\n \n   template <typename T> void emplace_arg(const T& arg) {\n-    data_.emplace_back(internal::make_arg<Context>(arg));\n+    if (has_named_args_) {\n+      if (data_.empty()) update_sentinel();\n+      data_.emplace_back(internal::make_arg<Context>(arg));\n+    } else {\n+      data_.emplace_back(internal::make_arg<Context>(arg));\n+    }\n   }\n \n  public:\n@@ -1496,13 +1533,35 @@ class dynamic_format_arg_store\n   template <typename T> void push_back(const T& arg) {\n     static_assert(\n         !std::is_base_of<internal::named_arg_base<char_type>, T>::value,\n-        \"named arguments are not supported yet\");\n+        \"use fmt::arg(...) to add named arguments\");\n     if (internal::const_check(need_copy<T>::value))\n       emplace_arg(dynamic_args_.push<stored_type<T>>(arg));\n     else\n       emplace_arg(arg);\n   }\n \n+  /**\n+    Adds a named argument into the dynamic store.\n+    Example:\n+      store.push_back(fmt::arg(\"name\", value));\n+  */\n+  template <typename T>\n+  void push_back(const internal::named_arg<T, char_type>& arg) {\n+    has_named_args_ = true;\n+    int id = static_cast<int>(count_args());\n+    named_info_.push_back({arg.name, id});\n+    // Update sentinel to reflect possible reallocation and new size.\n+    update_sentinel();\n+\n+    if (internal::const_check(need_copy<T>::value))\n+      emplace_arg(dynamic_args_.push<stored_type<T>>(arg.value));\n+    else\n+      emplace_arg(arg.value);\n+\n+    // Update sentinel again in case named_info_ reallocated.\n+    update_sentinel();\n+  }\n+\n   /**\n     Adds a reference to the argument into the dynamic store for later passing to\n     a formating function.\n@@ -1597,7 +1656,7 @@ template <typename Context> class basic_format_args {\n    \\endrst\n    */\n   FMT_INLINE basic_format_args(const dynamic_format_arg_store<Context>& store)\n-      : basic_format_args(store.get_types(), store.data_.data()) {}\n+      : basic_format_args(store.get_types(), store.data()) {}\n \n   /**\n    \\rst\n@@ -1836,4 +1895,4 @@ inline void print(const S& format_str, Args&&... args) {\n }\n FMT_END_NAMESPACE\n \n-#endif  // FMT_CORE_H_\n+#endif  // FMT_CORE_H_\n"
+      ]
+    },
+    {
+      "sample_index": 1,
+      "edit_locs": {
+        "include/fmt/core.h": [
+          "class: fmt::dynamic_format_arg_store\nline: 1471\nline: 1472\nfunction: fmt::dynamic_format_arg_store.push_back\nline: 1497\nline: 1498\nline: 1499\nfunction: fmt::basic_format_args(const dynamic_format_arg_store<Context>&)\nline: 1599\nclass: fmt::basic_format_arg"
+        ],
+        "include/fmt/format.h": [
+          ""
+        ],
+        "include/fmt/format-inl.h": [
+          ""
+        ]
+      },
+      "patches": [
+        "diff --git a/include/fmt/core.h b/include/fmt/core.h\nindex 1563a41..6d40951 100644\n--- a/include/fmt/core.h\n+++ b/include/fmt/core.h\n@@ -1597,7 +1597,7 @@ template <typename Context> class basic_format_args {\n    \\endrst\n    */\n   FMT_INLINE basic_format_args(const dynamic_format_arg_store<Context>& store)\n-      : basic_format_args(store.get_types(), store.data_.data()) {}\n+      : basic_format_args(store.get_types(), store.data_.args()) {}\n \n   /**\n    \\rst\n",
+        "diff --git a/include/fmt/core.h b/include/fmt/core.h\nindex 1563a41..a2463e5 100644\n--- a/include/fmt/core.h\n+++ b/include/fmt/core.h\n@@ -1,3 +1,4 @@\n+\n // Formatting library for C++ - the core API\n //\n // Copyright (c) 2012 - present, Victor Zverovich\n@@ -1131,6 +1132,7 @@ template <typename Context> class basic_format_arg {\n \n   friend class basic_format_args<Context>;\n   friend class internal::arg_map<Context>;\n+  friend class dynamic_format_arg_store<Context>;\n \n   using char_type = typename Context::char_type;\n \n@@ -1459,16 +1461,50 @@ class dynamic_format_arg_store\n                                     std::basic_string<char_type>, T>;\n \n   // Storage of basic_format_arg must be contiguous.\n-  std::vector<basic_format_arg<Context>> data_;\n+  mutable std::vector<basic_format_arg<Context>> data_;\n \n   // Storage of arguments not fitting into basic_format_arg must grow\n   // without relocation because items in data_ refer to it.\n   internal::dynamic_arg_list dynamic_args_;\n \n+  // Storage for named argument metadata.\n+  std::vector<internal::named_arg_info<char_type>> named_info_;\n+\n   friend class basic_format_args<Context>;\n \n+  // Whether a named-args sentinel is present at the beginning of data_.\n+  bool has_sentinel() const {\n+    return !data_.empty() && data_[0].type() == internal::type::none_type;\n+  }\n+\n+  // Whether we currently hold any named arguments.\n+  bool has_named_args() const { return !named_info_.empty(); }\n+\n+  // Returns the type descriptor taking into account named arguments.\n   unsigned long long get_types() const {\n-    return internal::is_unpacked_bit | data_.size();\n+    // Ensure sentinel is up to date before computing types/count.\n+    ensure_named_sentinel();\n+    unsigned long long count = internal::to_unsigned(has_sentinel() ? data_.size() - 1 : data_.size());\n+    unsigned long long types = internal::is_unpacked_bit | count;\n+    if (has_named_args()) types |= internal::has_named_args_bit;\n+    return types;\n+  }\n+\n+  // Ensures the sentinel for named arguments is present and up to date.\n+  void ensure_named_sentinel() const {\n+    if (!has_named_args()) return;\n+    basic_format_arg<Context> sentinel(named_info_.data(), named_info_.size());\n+    if (!has_sentinel()) {\n+      data_.insert(data_.begin(), sentinel);\n+    } else {\n+      data_[0] = sentinel;\n+    }\n+  }\n+\n+  // Returns a pointer to the first actual argument (skipping sentinel if any).\n+  const basic_format_arg<Context>* data_pointer() const {\n+    ensure_named_sentinel();\n+    return has_sentinel() ? data_.data() + 1 : data_.data();\n   }\n \n   template <typename T> void emplace_arg(const T& arg) {\n@@ -1494,15 +1530,34 @@ class dynamic_format_arg_store\n     \\endrst\n   */\n   template <typename T> void push_back(const T& arg) {\n-    static_assert(\n-        !std::is_base_of<internal::named_arg_base<char_type>, T>::value,\n-        \"named arguments are not supported yet\");\n     if (internal::const_check(need_copy<T>::value))\n       emplace_arg(dynamic_args_.push<stored_type<T>>(arg));\n     else\n       emplace_arg(arg);\n   }\n \n+  /**\n+    Adds a named argument into the dynamic store.\n+  */\n+  template <typename T>\n+  void push_back(const internal::named_arg<T, char_type>& arg) {\n+    // Compute index relative to the first actual argument.\n+    int id = static_cast<int>(has_sentinel() ? data_.size() - 1 : data_.size());\n+    named_info_.push_back({arg.name, id});\n+    if (internal::const_check(need_copy<T>::value))\n+      emplace_arg(dynamic_args_.push<stored_type<T>>(arg.value));\n+    else\n+      emplace_arg(arg.value);\n+  }\n+\n+  /**\n+    Emplaces a named argument into the dynamic store.\n+  */\n+  template <typename T>\n+  void emplace_back(const char_type* name, const T& value) {\n+    push_back(internal::named_arg<T, char_type>(name, value));\n+  }\n+\n   /**\n     Adds a reference to the argument into the dynamic store for later passing to\n     a formating function.\n@@ -1597,7 +1652,7 @@ template <typename Context> class basic_format_args {\n    \\endrst\n    */\n   FMT_INLINE basic_format_args(const dynamic_format_arg_store<Context>& store)\n-      : basic_format_args(store.get_types(), store.data_.data()) {}\n+      : basic_format_args(store.get_types(), store.data_pointer()) {}\n \n   /**\n    \\rst\n@@ -1836,4 +1891,4 @@ inline void print(const S& format_str, Args&&... args) {\n }\n FMT_END_NAMESPACE\n \n-#endif  // FMT_CORE_H_\n+#endif  // FMT_CORE_H_\n"
+      ]
+    }
+  ],
+  "6_final_selected_patch": "diff --git a/include/fmt/core.h b/include/fmt/core.h\nindex 1563a41..78ddd33 100644\n--- a/include/fmt/core.h\n+++ b/include/fmt/core.h\n@@ -1597,7 +1597,7 @@ template <typename Context> class basic_format_args {\n    \\endrst\n    */\n   FMT_INLINE basic_format_args(const dynamic_format_arg_store<Context>& store)\n-      : basic_format_args(store.get_types(), store.data_.data()) {}\n+      : basic_format_args(store.desc, store.data_.args()) {}\n \n   /**\n    \\rst\n",
+  "7_resolved": false
+}

@@ -1,0 +1,166 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..ba2a57fa2e 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,11 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            # If the database table name hasn't changed (e.g., an explicit
++            # db_table is set), renaming the model should be a no-op at the
++            # database level to avoid unnecessary constraint churn.
++            if old_model._meta.db_table == new_model._meta.db_table:
++                return
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+diff --git a/repro_m2m_db_table_noop.py b/repro_m2m_db_table_noop.py
+new file mode 100644
+index 0000000000..5c48c6ed65
+--- /dev/null
++++ b/repro_m2m_db_table_noop.py
+@@ -0,0 +1,59 @@
++import sys
++sys.path.insert(0, '/testbed')
++import django
++from django.conf import settings
++
++settings.configure(
++    INSTALLED_APPS=(
++        'django.contrib.contenttypes',
++    ),
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test',
++)
++
++django.setup()
++
++from django.db import connection, migrations, models
++from django.db.migrations.state import ProjectState
++
++app_label = 'repro2'
++state = ProjectState()
++ops = [
++    migrations.CreateModel('Tag', fields=[('id', models.AutoField(primary_key=True))]),
++    migrations.CreateModel('Author', fields=[('id', models.AutoField(primary_key=True)),], options={'db_table': 'author_one'}),
++    migrations.AddField('Author', 'tags', models.ManyToManyField('%s.Tag' % app_label)),
++]
++with connection.schema_editor() as editor:
++    for op in ops:
++        new_state = state.clone()
++        op.state_forwards(app_label, new_state)
++        op.database_forwards(app_label, editor, state, new_state)
++        state = new_state
++
++Author = state.apps.get_model(app_label, 'Author')
++Tag = state.apps.get_model(app_label, 'Tag')
++# Create initial data
++au = Author.objects.create()
++ta = Tag.objects.create()
++au.tags.add(ta)
++print('Initial M2M count:', Author.tags.through.objects.count())
++
++# Rename Author to Writer without changing db_table; should be NO-OP at DB level.
++rename_op = migrations.RenameModel('Author', 'Writer')
++new_state = state.clone()
++rename_op.state_forwards(app_label, new_state)
++with connection.schema_editor() as editor:
++    rename_op.database_forwards(app_label, editor, state, new_state)
++
++Writer = new_state.apps.get_model(app_label, 'Writer')
++Tag = new_state.apps.get_model(app_label, 'Tag')
++wr = Writer.objects.create()
++ta2 = Tag.objects.create()
++# Try adding m2m relation after rename.
++wr.tags.add(ta2)
++print('Post-rename M2M count:', Writer.tags.through.objects.count())
+diff --git a/repro_rename_db_table_noop.py b/repro_rename_db_table_noop.py
+new file mode 100644
+index 0000000000..1f7d83b8fe
+--- /dev/null
++++ b/repro_rename_db_table_noop.py
+@@ -0,0 +1,79 @@
++import sys
++sys.path.insert(0, '/testbed')
++import django
++from django.conf import settings
++
++# Minimal settings for using migration operations and schema editor.
++settings.configure(
++    INSTALLED_APPS=(
++        'django.contrib.contenttypes',
++    ),
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test',
++)
++
++django.setup()
++
++from django.db import connection, migrations, models
++from django.db.migrations.state import ProjectState
++from django.test.utils import CaptureQueriesContext
++
++# Prepare initial state: Author with explicit db_table and a Post with FK to Author.
++app_label = 'repro'
++project_state = ProjectState()
++ops = [
++    migrations.CreateModel(
++        'Author',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++        ],
++        options={'db_table': 'author_one'},
++    ),
++    migrations.CreateModel(
++        'Post',
++        fields=[
++            ('id', models.AutoField(primary_key=True)),
++            ('author', models.ForeignKey('%s.Author' % app_label, models.CASCADE)),
++        ],
++    ),
++]
++
++# Apply the create operations.
++with connection.schema_editor() as editor:
++    state = project_state
++    for op in ops:
++        new_state = state.clone()
++        op.state_forwards(app_label, new_state)
++        op.database_forwards(app_label, editor, state, new_state)
++        state = new_state
++
++# Confirm initial tables exist.
++with connection.cursor() as cursor:
++    tables = connection.introspection.table_names(cursor)
++    post_constraints_before = connection.introspection.get_constraints(cursor, 'repro_post')
++print('Initial tables:', sorted(tables))
++print('Initial FK constraints on repro_post:', [c for c in post_constraints_before.values() if c['foreign_key']])
++
++# Now perform RenameModel on Author -> NewAuthor. Since db_table is explicit and unchanged,
++# this should be a NO-OP at the database level.
++rename_op = migrations.RenameModel('Author', 'NewAuthor')
++new_state = state.clone()
++rename_op.state_forwards(app_label, new_state)
++
++with CaptureQueriesContext(connection) as ctx:
++    with connection.schema_editor() as editor:
++        rename_op.database_forwards(app_label, editor, state, new_state)
++
++print('Queries executed during RenameModel:', len(ctx))
++with connection.cursor() as cursor:
++    tables_after = connection.introspection.table_names(cursor)
++    post_constraints_after = connection.introspection.get_constraints(cursor, 'repro_post')
++print('Tables after rename:', sorted(tables_after))
++print('FK constraints on repro_post after:', [c for c in post_constraints_after.values() if c['foreign_key']])
++
++# Expectation: Tables unchanged and FK constraints unchanged.

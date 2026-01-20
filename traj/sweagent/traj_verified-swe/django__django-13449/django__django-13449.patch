@@ -1,0 +1,138 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..dd6a2ada5c 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1332,6 +1332,53 @@ class Window(Expression):
+             'window': ''.join(window_sql).strip()
+         }, params
+ 
++    def as_sqlite(self, compiler, connection, template=None):
++        """
++        On SQLite, ensure that expressions returning DecimalField are cast on the
++        full window expression rather than the inner function call. Otherwise,
++        CAST(function(...) AS NUMERIC) OVER (...) yields a syntax error. The
++        correct form is CAST(function(...) OVER (... ) AS NUMERIC).
++        """
++        connection.ops.check_expression_support(self)
++        if not connection.features.supports_over_clause:
++            raise NotSupportedError('This backend does not support window expressions.')
++        # Compile the source expression using the generic as_sql to avoid the
++        # SQLiteNumericMixin from wrapping only the function call.
++        expr_sql, expr_params = self.source_expression.as_sql(compiler, connection)
++        window_sql, window_params = [], []
++
++        if self.partition_by is not None:
++            sql_expr, sql_params = self.partition_by.as_sql(
++                compiler=compiler, connection=connection,
++                template='PARTITION BY %(expressions)s',
++            )
++            window_sql.extend(sql_expr)
++            window_params.extend(sql_params)
++
++        if self.order_by is not None:
++            window_sql.append(' ORDER BY ')
++            order_sql, order_params = compiler.compile(self.order_by)
++            window_sql.extend(order_sql)
++            window_params.extend(order_params)
++
++        if self.frame:
++            frame_sql, frame_params = compiler.compile(self.frame)
++            window_sql.append(' ' + frame_sql)
++            window_params.extend(frame_params)
++
++        params = list(expr_params) + window_params
++        template = template or self.template
++        sql = template % {
++            'expression': expr_sql,
++            'window': ''.join(window_sql).strip()
++        }
++        try:
++            if self.output_field.get_internal_type() == 'DecimalField':
++                sql = 'CAST(%s AS NUMERIC)' % sql
++        except FieldError:
++            pass
++        return sql, params
++
+     def __str__(self):
+         return '{} OVER ({}{}{})'.format(
+             str(self.source_expression),
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..6480198e9e
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,74 @@
++import sys
++import os
++
++# Ensure local django package is discoverable
++sys.path.insert(0, os.path.abspath('/testbed'))
++
++from django.conf import settings
++
++# Minimal settings for using Django ORM
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test',
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++            'django.contrib.auth',
++        ],
++        TIME_ZONE='UTC',
++        USE_TZ=True,
++    )
++
++import django
++from django.db import connection
++from django.db import models
++from django.db.models import F
++from django.db.models.functions import Lag
++from django.db.models.expressions import Window
++
++
++django.setup()
++
++# Define model dynamically with app_label since we didn't register an app
++class LagTest(models.Model):
++    modified = models.DateField()
++    data = models.FloatField()
++    amount = models.DecimalField(decimal_places=4, max_digits=7)
++
++    class Meta:
++        app_label = 'testapp'
++        managed = True
++        db_table = 'test1_lagtest'
++
++
++# Create the table
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(LagTest)
++
++# Insert some data
++from datetime import date
++LagTest.objects.create(modified=date(2020,1,1), data=1.0, amount='1.0000')
++LagTest.objects.create(modified=date(2020,1,1), data=2.0, amount='2.0000')
++LagTest.objects.create(modified=date(2020,1,1), data=3.0, amount='3.0000')
++LagTest.objects.create(modified=date(2020,1,2), data=3.0, amount='4.0000')
++LagTest.objects.create(modified=date(2020,1,2), data=4.0, amount='5.0000')
++
++# Run problematic query: Lag on DecimalField
++w = Window(expression=Lag('amount', 1), partition_by=[F('modified')], order_by=F('modified').asc())
++q = LagTest.objects.all().annotate(w=w)
++
++# Also run Lag on FloatField for comparison
++w2 = Window(expression=Lag('data', 1), partition_by=[F('modified')], order_by=F('modified').asc())
++q2 = LagTest.objects.all().annotate(w2=w2)
++
++# Force evaluation to trigger SQL execution and print results
++print('Decimal lag results:')
++print(list(q.values_list('id', 'modified', 'data', 'amount', 'w')))
++print('Float lag results:')
++print(list(q2.values_list('id', 'modified', 'data', 'amount', 'w2')))
++# Print the generated SQL for Decimal lag to inspect casting position
++from django.db import connection
++print('SQL for decimal lag:')
++print(str(q.query))
++

@@ -1,0 +1,105 @@
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 189fb4fa44..5647f4d124 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -8,6 +8,7 @@ circular import difficulties.
+ import copy
+ import functools
+ import inspect
++import enum
+ from collections import namedtuple
+ 
+ from django.db.models.constants import LOOKUP_SEP
+@@ -136,7 +137,11 @@ class DeferredAttribute:
+                 instance.refresh_from_db(fields=[field_name])
+                 val = getattr(instance, field_name)
+             data[field_name] = val
+-        return data[field_name]
++        value = data[field_name]
++        # If the value is an enum member (e.g. TextChoices/IntegerChoices), return its underlying value.
++        if isinstance(value, enum.Enum):
++            return value.value
++        return value
+ 
+     def _check_parent_chain(self, instance):
+         """
+@@ -150,6 +155,17 @@ class DeferredAttribute:
+             return getattr(instance, link_field.attname)
+         return None
+ 
++    def __set__(self, instance, value):
++        """
++        Set the value, converting enum members (e.g., TextChoices/IntegerChoices)
++        to their underlying primitive values to maintain consistent field types.
++        """
++        # Convert Enum members to their underlying value before storing.
++        if isinstance(value, enum.Enum):
++            value = value.value
++        instance.__dict__[self.field.attname] = value
++
++
+ 
+ class RegisterLookupMixin:
+ 
+diff --git a/repro_enum_integerchoices.py b/repro_enum_integerchoices.py
+new file mode 100644
+index 0000000000..29bf3f5233
+--- /dev/null
++++ b/repro_enum_integerchoices.py
+@@ -0,0 +1,22 @@
++from django.db import models
++from django.db.models.query_utils import DeferredAttribute
++
++class NumChoice(models.IntegerChoices):
++    ONE = 1, "One"
++    TWO = 2, "Two"
++
++class DummyField:
++    def __init__(self, attname):
++        self.attname = attname
++        self.primary_key = False
++        self.model = None
++
++class Obj:
++    pass
++
++setattr(Obj, 'num', DeferredAttribute(DummyField('num')))
++
++o = Obj()
++o.num = NumChoice.ONE
++print('Type:', type(o.num))
++print('Value:', o.num)
+diff --git a/repro_enum_textchoices.py b/repro_enum_textchoices.py
+new file mode 100644
+index 0000000000..56334d31cf
+--- /dev/null
++++ b/repro_enum_textchoices.py
+@@ -0,0 +1,28 @@
++from django.db import models
++from django.db.models.query_utils import DeferredAttribute
++
++# Define TextChoices
++class MyChoice(models.TextChoices):
++    FIRST_CHOICE = "first", "The first choice, it is"
++    SECOND_CHOICE = "second", "The second choice, it is"
++
++# Create a dummy field and class using the DeferredAttribute descriptor
++class DummyField:
++    def __init__(self, attname):
++        self.attname = attname
++        self.primary_key = False
++        self.model = None
++
++class MyObject:
++    pass
++
++# Attach descriptor to class to simulate Django model field access
++field = DummyField('my_str_value')
++setattr(MyObject, 'my_str_value', DeferredAttribute(field))
++
++# Simulate assignment with an enum value
++obj = MyObject()
++obj.my_str_value = MyChoice.FIRST_CHOICE
++
++print('Type before fix:', type(obj.my_str_value))
++print('Str before fix:', str(obj.my_str_value))

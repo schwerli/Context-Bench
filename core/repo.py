@@ -4,52 +4,94 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Optional
 
 def checkout(repo_url: str, commit: str, cache_dir: str, verbose: bool = True) -> Optional[str]:
-    """Checkout repo at specific commit. Direct clone, no mirror."""
+    """
+    Checkout repo at specific commit.
+
+    Concurrency-safe strategy:
+    - Keep one shared "base" clone per repo under cache_dir (never switch its HEAD).
+    - Create a dedicated detached worktree per commit under /tmp (or a configurable tmp root).
+      This prevents multiple commits from fighting over the same working directory.
+    """
     if not repo_url or not commit or not cache_dir:
         return None
     
     repo_key = _normalize_url(repo_url)
-    target_dir = os.path.join(cache_dir, repo_key)
-    
-    # Check if already exists and at correct commit
-    if os.path.isdir(target_dir):
-        if _verify_commit(target_dir, commit):
-            if verbose:
-                print(f"  Using existing checkout", file=sys.stderr)
-            return target_dir
-        else:
-            # Wrong commit, checkout the correct one
-            if verbose:
-                print(f"  Checking out commit {commit[:12]}", file=sys.stderr)
-            _git(["checkout", "-q", commit], cwd=target_dir)
-            if _verify_commit(target_dir, commit):
-                return target_dir
-    
-    # Clone repo
-    if verbose:
-        print(f"  Cloning {repo_url}", file=sys.stderr)
-    
+
     os.makedirs(cache_dir, exist_ok=True)
-    result = _git(["clone", "--progress", repo_url, target_dir], show_progress=True)
-    
-    if result.returncode != 0 or not os.path.isdir(target_dir):
-        if verbose:
-            print(f"  Clone failed", file=sys.stderr)
-        return None
-    
-    # Checkout specific commit
-    if verbose:
-        print(f"  Checking out commit {commit[:12]}", file=sys.stderr)
-    
-    _git(["checkout", "-q", commit], cwd=target_dir)
-    
-    if _verify_commit(target_dir, commit):
-        return target_dir
-    
-    return None
+
+    # If repo_url is an existing local git clone, use it as the base directly.
+    if os.path.isdir(repo_url) and os.path.isdir(os.path.join(repo_url, ".git")):
+        base_dir = repo_url
+    else:
+        base_dir = os.path.join(cache_dir, repo_key)
+
+    tmp_root = os.environ.get("CONTEXTBENCH_TMP_ROOT") or tempfile.gettempdir()
+    worktree_root = os.path.join(tmp_root, "contextbench_worktrees", repo_key)
+    worktree_dir = os.path.join(worktree_root, commit)
+
+    # Fast path: worktree already exists at the right commit
+    if os.path.isdir(worktree_dir) and _verify_commit(worktree_dir, commit):
+        return worktree_dir
+
+    lock_path = os.path.join(cache_dir, f"{repo_key}.lock")
+    with _file_lock(lock_path):
+        # Ensure base repo exists (only when not using an existing local clone)
+        if not os.path.isdir(os.path.join(base_dir, ".git")):
+            if verbose:
+                print(f"  Cloning base repo {repo_url}", file=sys.stderr)
+            for attempt in range(1, 4):
+                if os.path.isdir(base_dir):
+                    try:
+                        subprocess.run(["rm", "-rf", base_dir], check=False)
+                    except Exception:
+                        pass
+                result = _git(
+                    ["clone", "--filter=blob:none", "--no-checkout", "--progress", repo_url, base_dir],
+                    show_progress=verbose,
+                    timeout=1800,
+                )
+                if result.returncode == 0 and os.path.isdir(os.path.join(base_dir, ".git")):
+                    break
+                if verbose:
+                    print(f"  Base clone failed (attempt {attempt}/3)", file=sys.stderr)
+            else:
+                return None
+
+        # Fetch the desired commit into the base repo (does not change HEAD)
+        _git(
+            ["fetch", "--depth", "1", "--filter=blob:none", "origin", commit],
+            cwd=base_dir,
+            show_progress=verbose,
+            timeout=1800,
+        )
+
+        # Clean up stale worktree registrations (best-effort)
+        _git(["worktree", "prune"], cwd=base_dir, timeout=600)
+
+        # If another process created it while we waited for the lock, reuse it.
+        if os.path.isdir(worktree_dir) and _verify_commit(worktree_dir, commit):
+            return worktree_dir
+
+        os.makedirs(worktree_root, exist_ok=True)
+
+        # Create a detached worktree for the specific commit.
+        wt = _git(
+            ["worktree", "add", "--detach", worktree_dir, commit],
+            cwd=base_dir,
+            show_progress=verbose,
+            timeout=1800,
+        )
+        if wt.returncode != 0:
+            # If it failed because the directory/worktree exists, try to reuse.
+            if os.path.isdir(worktree_dir) and _verify_commit(worktree_dir, commit):
+                return worktree_dir
+            return None
+
+    return worktree_dir if _verify_commit(worktree_dir, commit) else None
 
 def _normalize_url(url: str) -> str:
     """Convert git URL to directory-safe name."""
@@ -58,17 +100,46 @@ def _normalize_url(url: str) -> str:
     s = s.replace("/", "__").replace(".git", "")
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s) or "repo"
 
-def _git(args, cwd=None, show_progress=False):
+class _file_lock:
+    def __init__(self, path: str):
+        self.path = path
+        self.f = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self.f = open(self.path, "a+", encoding="utf-8")
+        try:
+            import fcntl  # Linux
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # If flock is unavailable, proceed without a lock.
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.f:
+                try:
+                    import fcntl
+                    fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                self.f.close()
+        finally:
+            self.f = None
+        return False
+
+def _git(args, cwd=None, show_progress=False, timeout: int = 600):
     """Run git command."""
     if show_progress:
         # Show real-time output for clone/fetch operations
         return subprocess.run(
-            ["git"] + args, cwd=cwd, check=False, timeout=600
+            ["git"] + args, cwd=cwd, check=False, timeout=timeout
         )
     else:
         return subprocess.run(
             ["git"] + args, cwd=cwd, capture_output=True,
-            text=True, check=False, timeout=600
+            text=True, check=False, timeout=timeout
         )
 
 def _verify_commit(work_dir: str, expected: str) -> bool:

@@ -1,0 +1,110 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index caa03665ea..74514ddcd4 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -21,7 +21,7 @@ from django.utils.dateparse import (
+     parse_date, parse_datetime, parse_duration, parse_time,
+ )
+ from django.utils.duration import duration_microseconds, duration_string
+-from django.utils.functional import Promise, cached_property
++from django.utils.functional import Promise, LazyObject, cached_property, empty
+ from django.utils.ipv6 import clean_ipv6_address
+ from django.utils.itercompat import is_iterable
+ from django.utils.text import capfirst
+@@ -804,6 +804,19 @@ class Field(RegisterLookupMixin):
+         """Perform preliminary non-db specific value checks and conversions."""
+         if isinstance(value, Promise):
+             value = value._proxy____cast()
++        # Handle SimpleLazyObject and other LazyObject wrappers.
++        if isinstance(value, LazyObject):
++            # If not yet evaluated, force setup; otherwise unwrap.
++            if getattr(value, '_wrapped', empty) is empty:
++                value._setup()
++            value = value._wrapped
++        # If a model instance is supplied, compare on its primary key.
++        try:
++            # Avoid importing Model to prevent circular imports; use duck typing.
++            if hasattr(value, '_meta') and hasattr(value, 'pk'):
++                value = value.pk
++        except Exception:
++            pass
+         return value
+ 
+     def get_db_prep_value(self, value, connection, prepared=False):
+diff --git a/repro_lazyobject_subquery.py b/repro_lazyobject_subquery.py
+new file mode 100644
+index 0000000000..31b0309a03
+--- /dev/null
++++ b/repro_lazyobject_subquery.py
+@@ -0,0 +1,71 @@
++import os
++import sys
++
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "repro_settings")
++
++# Create minimal settings.
++from django.conf import settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.auth',
++            'django.contrib.contenttypes',
++            '__main__',
++        ],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        SECRET_KEY='test',
++        USE_TZ=True,
++    )
++
++import django
++django.setup()
++
++from django.db import models, connection
++from django.contrib.auth.models import User
++
++# Use __main__ app label to satisfy Django's app registry during script run.
++
++from django.db.models import OuterRef, Subquery
++from django.utils.functional import SimpleLazyObject
++
++# Define models A, B, C mimicking the PR.
++class A(models.Model):
++    class Meta:
++        app_label = '__main__'
++    pass
++
++class B(models.Model):
++    class Meta:
++        app_label = '__main__'
++    a = models.ForeignKey(A, on_delete=models.CASCADE)
++
++class C(models.Model):
++    class Meta:
++        app_label = '__main__'
++    owner = models.ForeignKey(User, on_delete=models.CASCADE)
++
++# Create tables using schema_editor.
++with connection.schema_editor() as schema:
++    schema.create_model(User)
++    schema.create_model(A)
++    schema.create_model(B)
++    schema.create_model(C)
++
++# Now perform operations from the PR.
++owner_user = (
++    B.objects.filter(a=OuterRef("pk"))
++    .annotate(owner_user=Subquery(C.objects.values("owner")))
++    .values("owner_user")
++)
++
++user = SimpleLazyObject(lambda: User.objects.create_user("testuser"))
++
++try:
++    # This should cause the error before the fix.
++    # We don't care about the actual results, just that evaluation doesn't crash.
++    list(A.objects.annotate(owner_user=Subquery(owner_user)).filter(owner_user=user))
++    print("Query executed successfully without TypeError.")
++except Exception as e:
++    # Show the exception type and message to confirm reproduction.
++    print("Exception:", type(e).__name__, str(e))
++    raise

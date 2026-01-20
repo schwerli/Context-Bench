@@ -1,0 +1,111 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index dafc11f995..f555259f2f 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -13,7 +13,7 @@ from django.forms.forms import BaseForm, DeclarativeFieldsMetaclass
+ from django.forms.formsets import BaseFormSet, formset_factory
+ from django.forms.utils import ErrorList
+ from django.forms.widgets import (
+-    HiddenInput, MultipleHiddenInput, SelectMultiple,
++    HiddenInput, MultipleHiddenInput, SelectMultiple, RadioSelect,
+ )
+ from django.utils.text import capfirst, get_text_list
+ from django.utils.translation import gettext, gettext_lazy as _
+@@ -1185,7 +1185,18 @@ class ModelChoiceField(ChoiceField):
+                  required=True, widget=None, label=None, initial=None,
+                  help_text='', to_field_name=None, limit_choices_to=None,
+                  **kwargs):
+-        if required and (initial is not None):
++        # Determine if the widget is a RadioSelect (or subclass). In that case,
++        # don't include an empty option when the field is required, even if
++        # initial is None, since radio groups have an inherent unselected state.
++        is_radio = False
++        if widget is not None:
++            try:
++                # If a widget class is provided.
++                is_radio = issubclass(widget, RadioSelect)
++            except TypeError:
++                # An instance was provided.
++                is_radio = isinstance(widget, RadioSelect)
++        if required and ((initial is not None) or is_radio):
+             self.empty_label = None
+         else:
+             self.empty_label = empty_label
+diff --git a/repro_radioselect_blank.py b/repro_radioselect_blank.py
+new file mode 100644
+index 0000000000..fc92e1884c
+--- /dev/null
++++ b/repro_radioselect_blank.py
+@@ -0,0 +1,72 @@
++# Reproduce behavior: RadioSelect for ModelChoiceField includes blank option and selects it when required and no initial.
++# After fix, it should not include blank option if widget is RadioSelect and model field is required (blank=False).
++
++from django.conf import settings
++
++# Minimal settings configuration
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        SECRET_KEY='test',
++    )
++
++import django
++
++django.setup()
++
++from django import forms
++from django.forms.widgets import RadioSelect
++
++# Create a simple object to act like a model instance.
++class DummyObj:
++    def __init__(self, pk, label):
++        self.pk = pk
++        self.label = label
++        class _Meta:
++            pass
++        self._meta = _Meta()
++    def __str__(self):
++        return self.label
++
++# Minimal QuerySet-like object compatible with ModelChoiceField expectations.
++class SimpleQuerySet:
++    def __init__(self, objects):
++        self._objects = list(objects)
++        self.model = DummyObj  # Simulate model
++        self._prefetch_related_lookups = ()
++    def all(self):
++        return self
++    def iterator(self):
++        return iter(self._objects)
++    def count(self):
++        return len(self._objects)
++    def exists(self):
++        return bool(self._objects)
++    def get(self, **kwargs):
++        key, value = next(iter(kwargs.items()))
++        for obj in self._objects:
++            if getattr(obj, key) == value:
++                return obj
++        raise self.model.DoesNotExist  # This won't be reached in this script
++
++# Add a fake DoesNotExist to DummyObj for completeness
++setattr(DummyObj, 'DoesNotExist', type('DoesNotExist', (Exception,), {}))
++
++# Prepare a queryset with one object
++qs = SimpleQuerySet([DummyObj(1, 'First Data File')])
++
++# Define a simple form using ModelChoiceField with RadioSelect
++class F(forms.Form):
++    data_file = forms.ModelChoiceField(queryset=qs, widget=RadioSelect(), required=True)
++
++f = F()  # unbound form, no initial
++html = str(f['data_file'])
++print('Rendered HTML for RadioSelect model choice (required, no initial):')
++print(html)
++
++# Show whether blank option appears and whether any input is checked
++print('\nSummary:')
++print('Contains blank "---------" option:', '---------' in html)
++print('Contains an input with checked="checked":', 'checked="checked"' in html)

@@ -27,6 +27,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ...parsers.diff import parse_diff_lines
+
 
 def _read_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -190,6 +192,128 @@ class PredContext:
             "pred_spans": self.pred_spans,
             "provenance": self.provenance,
         }
+
+def _extract_related_elements_symbols(rel: Any) -> Dict[str, List[str]]:
+    """Parse agentless `4_related_elements` into {file: [symbolName, ...]}.
+
+    Input values are typically list[str], where each string may contain multiple lines like:
+      "function: foo\\nclass: Bar\\nvariable: x"
+    """
+    out: Dict[str, List[str]] = {}
+    if not isinstance(rel, dict):
+        return out
+    for f, items in rel.items():
+        if not f:
+            continue
+        syms = _extract_symbols_from_blocks(items)
+        if syms:
+            out[f] = sorted(set(syms))
+    return out
+
+
+def _spans_from_patch(diff_text: str) -> Dict[str, List[Dict[str, int]]]:
+    """Convert a unified diff into {file: [{type:'line', start, end}, ...]} (new-file coordinates)."""
+    spans: Dict[str, List[Dict[str, int]]] = {}
+    if not diff_text:
+        return spans
+    line_ranges = parse_diff_lines(diff_text, deletions_only=False)
+    for f, intervals in (line_ranges or {}).items():
+        for a, b in intervals:
+            spans.setdefault(f, []).append({"type": "line", "start": int(a), "end": int(b)})
+    return spans
+
+
+def _merge_line_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not intervals:
+        return []
+    intervals = sorted((int(a), int(b)) for a, b in intervals)
+    merged = [intervals[0]]
+    for a, b in intervals[1:]:
+        la, lb = merged[-1]
+        if a <= lb + 1:
+            merged[-1] = (la, max(lb, b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _spans_from_edit_locs(data: Dict[str, Any]) -> Dict[str, List[Dict[str, int]]]:
+    """Extract span-level predictions from agentless sampled edit locations.
+
+    We choose the first sample whose edit_locs contains any `line:`/`lines:` entries,
+    then parse all line mentions for each file and merge adjacent line intervals.
+    """
+    out: Dict[str, List[Dict[str, int]]] = {}
+    samples = data.get("5_sampled_edit_locs_and_patches") or []
+    if not isinstance(samples, list):
+        return out
+
+    chosen: Optional[Dict[str, Any]] = None
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        edit_locs = s.get("edit_locs")
+        if not isinstance(edit_locs, dict):
+            continue
+        # Detect presence of any explicit line annotations in this sample.
+        has_line = False
+        for loc_lines in edit_locs.values():
+            if not isinstance(loc_lines, list):
+                continue
+            for raw in loc_lines:
+                if isinstance(raw, str) and ("line:" in raw or "lines:" in raw):
+                    has_line = True
+                    break
+            if has_line:
+                break
+        if has_line:
+            chosen = s
+            break
+
+    if chosen is None:
+        return out
+
+    edit_locs = chosen.get("edit_locs") or {}
+    if not isinstance(edit_locs, dict):
+        return out
+
+    for f, loc_lines in edit_locs.items():
+        if not f or not isinstance(loc_lines, list):
+            continue
+        spans = _parse_edit_loc_lines(loc_lines)  # returns list[(start,end)]
+        spans = _merge_line_intervals(spans)
+        if spans:
+            out[f] = [{"type": "line", "start": a, "end": b} for a, b in spans]
+    return out
+
+
+def extract_trajectory(traj_file: str) -> Dict[str, Any]:
+    """Extract trajectory from agentless `*_traj.json`.
+
+    Returns the same unified format expected by `contextbench_eval.parsers.trajectory`:
+    {
+      'pred_steps': [{'files': [...], 'spans': {...}, 'symbols': {...}}],
+      'pred_files': [...],
+      'pred_spans': {...},
+      'pred_symbols': {...}   # optional, used by extended symbol metrics
+    }
+    """
+    with open(traj_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        return {"pred_steps": [], "pred_files": [], "pred_spans": {}, "pred_symbols": {}}
+
+    pred_files = data.get("3_final_combined_files") or data.get("2_embedding_selected_files") or []
+    pred_files = sorted(set(f for f in pred_files if isinstance(f, str) and f))
+
+    pred_symbols = _extract_related_elements_symbols(data.get("4_related_elements"))
+    # Span-level should come from sampled edit locations (line numbers), not from the patch.
+    # The patch is reserved for EditLoc metrics only.
+    pred_spans = _spans_from_edit_locs(data)
+
+    step = {"files": pred_files, "spans": pred_spans, "symbols": pred_symbols}
+    return {"pred_steps": [step], "pred_files": pred_files, "pred_spans": pred_spans, "pred_symbols": pred_symbols}
 
 
 def _read_file_span_text(repo_dir: str, rel_file: str, start_line: int, end_line: int) -> str:

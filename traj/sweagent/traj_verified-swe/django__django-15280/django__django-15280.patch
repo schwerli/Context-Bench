@@ -1,0 +1,193 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fb6639793a..1f2e3aa391 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1685,6 +1685,15 @@ def prefetch_related_objects(model_instances, *related_lookups):
+     if not model_instances:
+         return  # nothing to do
+ 
++    # Index of the top-level model instances by model class and primary key.
++    # This allows merging of fields when following prefetches back to the
++    # parent object (e.g., profile__user back to User).
++    try:
++        top_model = model_instances[0]._meta.concrete_model
++        source_objs_index = {top_model: {obj.pk: obj for obj in model_instances}}
++    except Exception:
++        source_objs_index = {}
++
+     # We need to be able to dynamically add to the list of prefetch_related
+     # lookups that we look up (see below).  So we need some book keeping to
+     # ensure we don't do duplicate work.
+@@ -1770,6 +1779,7 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                     prefetcher,
+                     lookup,
+                     level,
++                    source_objs_index=source_objs_index,
+                 )
+                 # We need to ensure we don't keep adding lookups from the
+                 # same relationships to stop infinite recursion. So, if we
+@@ -1789,8 +1799,9 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                 # We replace the current list of parent objects with the list
+                 # of related objects, filtering out empty or missing values so
+                 # that we can continue with nullable or reverse relations.
++                parent_obj_list = obj_list
+                 new_obj_list = []
+-                for obj in obj_list:
++                for obj in parent_obj_list:
+                     if through_attr in getattr(obj, '_prefetched_objects_cache', ()):
+                         # If related objects have been prefetched, use the
+                         # cache rather than the object's through_attr.
+@@ -1807,10 +1818,37 @@ def prefetch_related_objects(model_instances, *related_lookups):
+                     # user models that define __iter__.
+                     if isinstance(new_obj, list):
+                         new_obj_list.extend(new_obj)
++
+                     else:
+                         new_obj_list.append(new_obj)
+                 obj_list = new_obj_list
+ 
++                # Whether or not we're prefetching the last part of the lookup.
++                leaf = len(lookup.prefetch_through.split(LOOKUP_SEP)) - 1 == level
++
++                if leaf and lookup.queryset is not None and obj_list:
++                    try:
++                        rel_qs, rel_obj_attr, instance_attr, single, cache_name, is_descriptor = (
++                            prefetcher.get_prefetch_queryset(parent_obj_list, lookup.get_current_queryset(level))
++                        )
++                        fetched = list(rel_qs)
++                        # Map fetched related objects by their primary keys.
++                        by_pk = {getattr(o, o._meta.pk.attname): o for o in fetched}
++                        for existing in obj_list:
++                            pk = getattr(existing, existing._meta.pk.attname)
++                            src = by_pk.get(pk)
++                            if src is None:
++                                continue
++                            # Merge only the loaded (non-deferred) fields from src.
++                            for field in existing._meta.concrete_fields:
++                                attname = field.attname
++                                if attname in src.__dict__ and attname not in existing.__dict__:
++                                    existing.__dict__[attname] = src.__dict__[attname]
++                    except Exception:
++                        # Be tolerant to errors here; if anything goes wrong, fall
++                        # back to the default behavior.
++                        pass
++
+ 
+ def get_prefetcher(instance, through_attr, to_attr):
+     """
+@@ -1866,7 +1904,7 @@ def get_prefetcher(instance, through_attr, to_attr):
+     return prefetcher, rel_obj_descriptor, attr_found, is_fetched
+ 
+ 
+-def prefetch_one_level(instances, prefetcher, lookup, level):
++def prefetch_one_level(instances, prefetcher, lookup, level, source_objs_index=None):
+     """
+     Helper function for prefetch_related_objects().
+ 
+@@ -1947,7 +1985,26 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+             else:
+                 # No to_attr has been given for this prefetch operation and the
+                 # cache_name does not point to a descriptor. Store the value of
+-                # the field in the object's field cache.
++                # the field in the object's field cache. If an original
++                # top-level instance exists for this related object, merge the
++                # loaded fields and use that instance to avoid unexpected
++                # deferred loads when following back to the parent.
++                if source_objs_index and val is not None:
++                    try:
++                        model_map = source_objs_index.get(val.__class__)
++                        if model_map is not None:
++                            orig = model_map.get(getattr(val, val._meta.pk.attname))
++                            if orig is not None:
++                                # Merge loaded fields present on val into orig.
++                                for field in orig._meta.concrete_fields:
++                                    attname = field.attname
++                                    if attname in val.__dict__ and attname not in orig.__dict__:
++                                        orig.__dict__[attname] = val.__dict__[attname]
++                                obj._state.fields_cache[cache_name] = orig
++                                continue
++                    except Exception:
++                        # Fall back to default behavior if anything goes wrong.
++                        pass
+                 obj._state.fields_cache[cache_name] = val
+         else:
+             if as_attr:
+diff --git a/repro_prefetch_deferred.py b/repro_prefetch_deferred.py
+new file mode 100644
+index 0000000000..1e90867b6f
+--- /dev/null
++++ b/repro_prefetch_deferred.py
+@@ -0,0 +1,73 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    SECRET_KEY='x',
++    DEBUG=True,
++    USE_TZ=False,
++)
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models import Prefetch
++
++class User(models.Model):
++    email = models.EmailField()
++    kind = models.CharField(max_length=10)
++    class Meta:
++        app_label = 'testsapp'
++
++class Profile(models.Model):
++    full_name = models.CharField(max_length=255)
++    user = models.OneToOneField(User, on_delete=models.CASCADE)
++    class Meta:
++        app_label = 'testsapp'
++
++# Create tables
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(User)
++    schema_editor.create_model(Profile)
++
++# Create data
++u = User.objects.create(email='test@example.com', kind='ADMIN')
++Profile.objects.create(user=u, full_name='Test Tester')
++
++# Build queryset
++qs = User.objects.only('email').prefetch_related(
++    Prefetch(
++        'profile',
++        queryset=Profile.objects.prefetch_related(
++            Prefetch('user', queryset=User.objects.only('kind'))
++        ),
++    )
++)
++
++# Evaluate main queryset (expect 3 queries)
++connection.queries_log.clear()
++user = qs.first()
++print('Initial queries:', len(connection.queries))
++for i, q in enumerate(connection.queries, 1):
++    print(f'{i}. {q["sql"]}')
++prof = user.profile
++print('Profile.user cached?', 'user' in prof._state.fields_cache)
++if 'user' in prof._state.fields_cache:
++    cached_user = prof._state.fields_cache['user']
++    print('Profile.user cached id:', id(cached_user), 'dict keys:', sorted(cached_user.__dict__.keys()))
++
++# Access nested kind and check if extra query occurs
++connection.queries_log.clear()
++inner = user.profile.user
++print('Outer user id:', id(user), 'pk:', user.pk)
++print('Inner user id:', id(inner), 'pk:', inner.pk)
++print('Inner user dict keys before access:', sorted(inner.__dict__.keys()))
++print('Inner deferred fields set:', inner.get_deferred_fields())
++val = inner.kind
++print('Nested access value:', val)
++print('Extra queries after access:', len(connection.queries))
++for i, q in enumerate(connection.queries, 1):
++    print(f'{i}. {q["sql"]}')

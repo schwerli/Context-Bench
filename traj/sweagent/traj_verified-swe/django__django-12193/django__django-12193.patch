@@ -1,0 +1,72 @@
+diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py
+index 2e19cd574a..7dfddb068e 100644
+--- a/django/contrib/postgres/forms/array.py
++++ b/django/contrib/postgres/forms/array.py
+@@ -144,10 +144,12 @@ class SplitArrayWidget(forms.Widget):
+                 widget_value = value[i]
+             except IndexError:
+                 widget_value = None
++            # Create per-subwidget attrs to prevent mutation (e.g., CheckboxInput adding 'checked')
++            widget_attrs = final_attrs.copy()
+             if id_:
+-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++                widget_attrs['id'] = '%s_%s' % (id_, i)
+             context['widget']['subwidgets'].append(
+-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
+             )
+         return context
+ 
+diff --git a/repro_splitarray_boolean.py b/repro_splitarray_boolean.py
+new file mode 100644
+index 0000000000..23f7bf7e7a
+--- /dev/null
++++ b/repro_splitarray_boolean.py
+@@ -0,0 +1,47 @@
++# Reproducer for SplitArrayField + BooleanField checkbox checked propagation bug
++from django import forms
++from django.conf import settings
++
++# Minimal settings configuration to allow forms usage
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test',
++        INSTALLED_APPS=[
++            'django.contrib.postgres',
++        ],
++    )
++
++# We avoid importing django.contrib.postgres.forms package to prevent psycopg2 import.
++import importlib.machinery
++import importlib.util
++import os
++
++# Load the SplitArrayWidget class directly from source file with correct package context.
++import sys, types
++base_dir = os.path.join(os.path.dirname(__file__), 'django', 'contrib', 'postgres')
++forms_pkg_name = 'django.contrib.postgres.forms'
++forms_pkg = types.ModuleType(forms_pkg_name)
++forms_pkg.__path__ = [os.path.join(base_dir, 'forms')]
++sys.modules[forms_pkg_name] = forms_pkg
++
++# Ensure parent package exists in sys.modules
++pg_pkg_name = 'django.contrib.postgres'
++if pg_pkg_name not in sys.modules:
++    pg_pkg = types.ModuleType(pg_pkg_name)
++    pg_pkg.__path__ = [base_dir]
++    sys.modules[pg_pkg_name] = pg_pkg
++
++path = os.path.join(base_dir, 'forms', 'array.py')
++spec = importlib.util.spec_from_file_location('django.contrib.postgres.forms.array', path)
++mod = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = mod
++spec.loader.exec_module(mod)
++SplitArrayWidget = mod.SplitArrayWidget
++
++# Use Django's CheckboxInput to simulate BooleanField's widget
++w = SplitArrayWidget(widget=forms.CheckboxInput(), size=3)
++value = [True, False, False]
++ctx = w.get_context('arr', value, {'id': 'id_arr'})
++subwidgets = ctx['widget']['subwidgets']
++print('Subwidgets checked flags:', [('checked' in sw['attrs']) for sw in subwidgets])

@@ -1,0 +1,73 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 85cd8311a7..e47e5160d3 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1219,15 +1219,25 @@ class QuerySet:
+         """
+         Return True if the QuerySet is ordered -- i.e. has an order_by()
+         clause or a default ordering on the model (or is empty).
++
++        For queries with GROUP BY, default model ordering is suppressed in SQL
++        unless an explicit order_by() or extra(order_by=...) is provided.
++        In such cases, ordered should be False.
+         """
+         if isinstance(self, EmptyQuerySet):
+             return True
++        # Explicit ordering always results in an ORDER BY clause.
+         if self.query.extra_order_by or self.query.order_by:
+             return True
+-        elif self.query.default_ordering and self.query.get_meta().ordering:
+-            return True
+-        else:
++        # If the query performs grouping, default model ordering is not applied
++        # to the SQL output (see compiler.as_sql()). Therefore, consider it
++        # unordered in this case.
++        if self.query.group_by is not None:
+             return False
++        # Otherwise, respect the model's default ordering if present.
++        if self.query.default_ordering and self.query.get_meta().ordering:
++            return True
++        return False
+ 
+     @property
+     def db(self):
+diff --git a/repro_ordered_groupby.py b/repro_ordered_groupby.py
+new file mode 100644
+index 0000000000..6b5de0fd7d
+--- /dev/null
++++ b/repro_ordered_groupby.py
+@@ -0,0 +1,34 @@
++# Reproduction script for QuerySet.ordered with GROUP BY.
++# It constructs a minimal fake model with Meta.ordering and a QuerySet
++# whose underlying Query has group_by=True and no explicit order_by.
++# Expected: ordered should be False when GROUP BY is present without explicit ordering.
++# Current behavior (before fix): ordered is True due to default ordering.
++
++from django.db.models import sql
++from django.db.models.query import QuerySet
++
++class Meta:
++    ordering = ['name']
++
++class FakeModel:
++    _meta = Meta()
++
++# Create a Query and set group_by=True to simulate annotation with aggregate
++q = sql.Query(FakeModel)
++q.group_by = True
++# No explicit order_by set and default_ordering is True by default
++
++qs = QuerySet(model=FakeModel, query=q)
++print("group_by:", q.group_by)
++print("default_ordering:", q.default_ordering)
++print("meta.ordering:", q.get_meta().ordering)
++print("explicit order_by:", q.order_by)
++print("explicit extra_order_by:", q.extra_order_by)
++print("QuerySet.ordered:", qs.ordered)
++
++# Now simulate explicit ordering to ensure .ordered becomes True.
++q2 = sql.Query(FakeModel)
++q2.group_by = True
++q2.order_by = ('num_notes',)
++qs2 = QuerySet(model=FakeModel, query=q2)
++print("With explicit order_by, QuerySet.ordered:", qs2.ordered)

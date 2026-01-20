@@ -1,0 +1,103 @@
+diff --git a/changelog/XXXXX.bugfix.rst b/changelog/XXXXX.bugfix.rst
+new file mode 100644
+index 000000000..8e3c69ab8
+--- /dev/null
++++ b/changelog/XXXXX.bugfix.rst
+@@ -0,0 +1 @@
++Considered MRO when obtaining marks for classes with multiple inheritance. Marks declared via pytestmark on base classes are now merged following MRO order, so subclasses inherit all base class marks instead of one overriding the other.
+diff --git a/repro_mro.py b/repro_mro.py
+new file mode 100644
+index 000000000..770d1e9d1
+--- /dev/null
++++ b/repro_mro.py
+@@ -0,0 +1,34 @@
++import os, sys, textwrap, subprocess, tempfile
++
++def main():
++    d = tempfile.mkdtemp()
++    test_path = os.path.join(d, 'test_mro.py')
++    with open(test_path, 'w') as f:
++        f.write(textwrap.dedent('''
++            import pytest
++
++            @pytest.mark.foo
++            class Foo:
++                pass
++
++            @pytest.mark.bar
++            class Bar:
++                pass
++
++            class TestDings(Foo, Bar):
++                def test_dings(self):
++                    pass
++        '''))
++    # Run pytest selecting tests that must have both markers
++    cmd = [sys.executable, '-m', 'pytest', '-q', '-m', 'foo and bar', test_path]
++    print('Running:', ' '.join(cmd))
++    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    print(res.stdout)
++    print('Exit code:', res.returncode)
++    # Assert that exactly one test passed
++    ok = ('1 passed' in res.stdout) and res.returncode == 0
++    print('Result OK:', ok)
++    return 0 if ok else 1
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/src/_pytest/mark/structures.py b/src/_pytest/mark/structures.py
+index 800a25c92..2da8f3b28 100644
+--- a/src/_pytest/mark/structures.py
++++ b/src/_pytest/mark/structures.py
+@@ -356,7 +356,31 @@ class MarkDecorator:
+ 
+ 
+ def get_unpacked_marks(obj: object) -> Iterable[Mark]:
+-    """Obtain the unpacked marks that are stored on an object."""
++    """Obtain the unpacked marks that are stored on an object.
++
++    When ``obj`` is a class, consider all ``pytestmark`` attributes found
++    along its MRO, merging them into a single sequence. Marks are
++    deduplicated by name following MRO order (closest class first).
++    """
++    import inspect
++
++    # For classes, merge pytestmark from all classes in the MRO (including self).
++    if inspect.isclass(obj):
++        merged: List[Mark] = []
++        seen: Set[str] = set()
++        for cls in obj.__mro__:
++            mark_list = getattr(cls, "pytestmark", [])
++            if not isinstance(mark_list, list):
++                mark_list = [mark_list]
++            for mark in normalize_mark_list(mark_list):
++                # Deduplicate by mark name, preferring the first occurrence
++                # encountered following MRO order.
++                if mark.name not in seen:
++                    merged.append(mark)
++                    seen.add(mark.name)
++        return merged
++
++    # Non-class objects: behave as before, only consider the local attribute.
+     mark_list = getattr(obj, "pytestmark", [])
+     if not isinstance(mark_list, list):
+         mark_list = [mark_list]
+@@ -384,11 +408,16 @@ def store_mark(obj, mark: Mark) -> None:
+     """Store a Mark on an object.
+ 
+     This is used to implement the Mark declarations/decorators correctly.
++    Only the local ``pytestmark`` attribute of ``obj`` is modified; inherited
++    marks are not materialized into the local attribute.
+     """
+     assert isinstance(mark, Mark), mark
+     # Always reassign name to avoid updating pytestmark in a reference that
+-    # was only borrowed.
+-    obj.pytestmark = [*get_unpacked_marks(obj), mark]
++    # was only borrowed. Only extend the local attribute, not considering MRO.
++    current = getattr(obj, "pytestmark", [])
++    if not isinstance(current, list):
++        current = [current]
++    obj.pytestmark = [*normalize_mark_list(current), mark]
+ 
+ 
+ # Typing for builtin pytest marks. This is cheating; it gives builtin marks

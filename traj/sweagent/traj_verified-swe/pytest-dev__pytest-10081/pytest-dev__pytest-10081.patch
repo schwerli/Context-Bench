@@ -1,0 +1,134 @@
+diff --git a/repro_pdb_skip_class.py b/repro_pdb_skip_class.py
+new file mode 100644
+index 000000000..1ad04ba05
+--- /dev/null
++++ b/repro_pdb_skip_class.py
+@@ -0,0 +1,41 @@
++import os, sys, textwrap
++
++# Ensure we import pytest from this repository
++repo_src = os.path.join(os.path.dirname(__file__), 'src')
++if repo_src not in sys.path:
++    sys.path.insert(0, repo_src)
++
++import pytest
++
++# Create a temporary test file for reproduction
++TEST_FILE = os.path.join(os.path.dirname(__file__), 'test_repro_skip_class.py')
++with open(TEST_FILE, 'w') as f:
++    f.write(textwrap.dedent('''
++    import unittest
++    import pytest as _pytest
++
++    # track calls to setUp/tearDown
++    _pytest._pdb_skip_class_calls = []
++
++    @unittest.skip("hello")
++    class MyTestCase(unittest.TestCase):
++        def setUp(self):
++            _pytest._pdb_skip_class_calls.append("setUp")
++        def test_one(self):
++            pass
++        def tearDown(self):
++            _pytest._pdb_skip_class_calls.append("tearDown")
++    '''))
++
++print('Running pytest without --pdb (should be 1 skipped and no setup/teardown calls):')
++ret1 = pytest.main([TEST_FILE, '-q'])
++print('Exit code:', ret1)
++print('Calls recorded:', getattr(pytest, '_pdb_skip_class_calls', []))
++
++# reset tracking
++pytest._pdb_skip_class_calls = []
++
++print('\nRunning pytest with --pdb (buggy behavior: tearDown may be called even though class is skipped):')
++ret2 = pytest.main(['--pdb', TEST_FILE, '-q'])
++print('Exit code:', ret2)
++print('Calls recorded:', getattr(pytest, '_pdb_skip_class_calls', []))
+diff --git a/repro_pdb_teardown_called.py b/repro_pdb_teardown_called.py
+new file mode 100644
+index 000000000..79296183a
+--- /dev/null
++++ b/repro_pdb_teardown_called.py
+@@ -0,0 +1,26 @@
++import os, sys, textwrap
++repo_src = os.path.join(os.path.dirname(__file__), 'src')
++if repo_src not in sys.path:
++    sys.path.insert(0, repo_src)
++import pytest
++
++TEST_FILE = os.path.join(os.path.dirname(__file__), 'test_pdb_teardown_called_case.py')
++with open(TEST_FILE, 'w') as f:
++    f.write(textwrap.dedent('''
++    import unittest
++    import pytest as _pytest
++
++    _pytest._calls = []
++
++    class MyTestCase(unittest.TestCase):
++        def tearDown(self):
++            _pytest._calls.append(self.id())
++        def test_1(self):
++            pass
++        def test_2(self):
++            pass
++    '''))
++
++ret = pytest.main(['--pdb', TEST_FILE, '-q'])
++print('Exit code:', ret)
++print('Calls:', getattr(pytest, '_calls', []))
+diff --git a/src/_pytest/unittest.py b/src/_pytest/unittest.py
+index 851e4943b..1b158cb37 100644
+--- a/src/_pytest/unittest.py
++++ b/src/_pytest/unittest.py
+@@ -316,7 +316,9 @@ class TestCaseFunction(Function):
+             # Arguably we could always postpone tearDown(), but this changes the moment where the
+             # TestCase instance interacts with the results object, so better to only do it
+             # when absolutely needed.
+-            if self.config.getoption("usepdb") and not _is_skipped(self.obj):
++            if self.config.getoption("usepdb") and not (
++                _is_skipped(self.obj) or _is_skipped(self._testcase)
++            ):
+                 self._explicit_tearDown = self._testcase.tearDown
+                 setattr(self._testcase, "tearDown", lambda *args: None)
+ 
+diff --git a/test_pdb_teardown_called_case.py b/test_pdb_teardown_called_case.py
+new file mode 100644
+index 000000000..4ca2516e5
+--- /dev/null
++++ b/test_pdb_teardown_called_case.py
+@@ -0,0 +1,13 @@
++
++import unittest
++import pytest as _pytest
++
++_pytest._calls = []
++
++class MyTestCase(unittest.TestCase):
++    def tearDown(self):
++        _pytest._calls.append(self.id())
++    def test_1(self):
++        pass
++    def test_2(self):
++        pass
+diff --git a/test_repro_skip_class.py b/test_repro_skip_class.py
+new file mode 100644
+index 000000000..7fd5694f6
+--- /dev/null
++++ b/test_repro_skip_class.py
+@@ -0,0 +1,15 @@
++
++import unittest
++import pytest as _pytest
++
++# track calls to setUp/tearDown
++_pytest._pdb_skip_class_calls = []
++
++@unittest.skip("hello")
++class MyTestCase(unittest.TestCase):
++    def setUp(self):
++        _pytest._pdb_skip_class_calls.append("setUp")
++    def test_one(self):
++        pass
++    def tearDown(self):
++        _pytest._pdb_skip_class_calls.append("tearDown")

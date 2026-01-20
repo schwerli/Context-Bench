@@ -1,0 +1,121 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index eaccc96d7d..1d3063f46c 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -702,8 +702,49 @@ class SQLCompiler:
+         """
+         Return the table alias (the name might be ambiguous, the alias will
+         not be) and column name for ordering by the given 'name' parameter.
+-        The 'name' is of the form 'field1__field2__...__fieldN'.
++        The 'name' is of the form 'field1__field2__...__fieldN' or an
++        expression.
+         """
++        # If an expression is passed (e.g. an OrderBy/F/Func), adapt it to the
++        # given alias and default order. This can occur when recursing into a
++        # related model's Meta.ordering which may contain expressions.
++        if hasattr(name, 'resolve_expression'):
++            expr = name
++            # Ensure we have an OrderBy instance and respect default_order.
++            if isinstance(expr, OrderBy):
++                # Clone to avoid mutating the original expression.
++                expr = expr.copy()
++                if default_order == 'DESC':
++                    expr.reverse_ordering()
++            else:
++                expr = OrderBy(expr, descending=(default_order == 'DESC'))
++
++            # Replace any field references (F/strings inside functions) with
++            # column references targeting the provided alias.
++            def replace_refs(e):
++                # Base case: F() reference becomes a column on the current alias.
++                from django.db.models.expressions import F, BaseExpression
++                if isinstance(e, F):
++                    pieces = e.name.split(LOOKUP_SEP)
++                    field, targets, a, joins, path, _opts, transform_function = self._setup_joins(pieces, opts, alias)
++                    targets, a, _ = self.query.trim_joins(targets, joins, path)
++                    # Use the first target; multi-target fields yield multiple
++                    # columns which aren't supported in ordering expressions.
++                    # They would be handled similarly to the default path below.
++                    return transform_function(targets[0], a)
++                # Recurse into expression trees.
++                if hasattr(e, 'get_source_expressions'):
++                    children = e.get_source_expressions()
++                    if not children:
++                        return e
++                    e = e.copy()
++                    e.set_source_expressions([replace_refs(child) for child in children])
++                    return e
++                return e
++
++            expr.set_source_expressions([replace_refs(e) for e in expr.get_source_expressions()])
++            return [(expr, False)]
++
+         name, order = get_order_dir(name, default_order)
+         descending = order == 'DESC'
+         pieces = name.split(LOOKUP_SEP)
+diff --git a/repro_ordering_meta_expr.py b/repro_ordering_meta_expr.py
+new file mode 100644
+index 0000000000..3dff483407
+--- /dev/null
++++ b/repro_ordering_meta_expr.py
+@@ -0,0 +1,60 @@
++# Reproduction script for bug: order_by() a parent model crash when Meta.ordering contains expressions.
++# Additional checks for Upper() and nulls handling.
++
++# It triggers SQLCompiler.find_ordering_name() with a relation whose target model's Meta.ordering contains expressions.
++
++import django
++from django.conf import settings
++
++# Minimal settings configuration.
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++    )
++
++django.setup()
++
++from django.db import models, connection
++from django.db.models.functions import Upper
++from django.db.models.sql.query import Query
++from django.db.models.sql.compiler import SQLCompiler
++
++
++class B(models.Model):
++    name = models.CharField(max_length=50)
++
++    class Meta:
++        app_label = 'myapp'
++        # Expressions in Meta.ordering, including a function and nulls handling.
++        ordering = (
++            models.F('name').asc(),
++            Upper('name').desc(nulls_last=True),
++        )
++
++
++class A(models.Model):
++    b = models.ForeignKey(B, models.CASCADE)
++
++    class Meta:
++        app_label = 'myapp'
++
++
++# Build a Query and SQLCompiler, then call find_ordering_name on the relation field 'b'.
++q = Query(A)
++compiler = SQLCompiler(q, connection, 'default')
++
++try:
++    result = compiler.find_ordering_name('b', A._meta, default_order='ASC')
++    print('Result:', result)
++except Exception as e:
++    # Print the exception to confirm the bug.
++    import traceback
++    traceback.print_exc()

@@ -1,0 +1,67 @@
+{
+    "instance_id": "SWE-PolyBench__python__maintenance__bugfix__2b00c0d1",
+    "original_id": "huggingface__transformers-26839",
+    "1_model_selected_files": [
+        "src/transformers/models/idefics/modeling_idefics.py",
+        "src/transformers/models/idefics/processing_idefics.py",
+        "src/transformers/models/idefics/configuration_idefics.py",
+        "src/transformers/models/idefics/perceiver.py",
+        "src/transformers/models/idefics/vision.py"
+    ],
+    "2_embedding_selected_files": [],
+    "3_final_combined_files": [
+        "src/transformers/models/idefics/modeling_idefics.py",
+        "src/transformers/models/idefics/processing_idefics.py",
+        "src/transformers/models/idefics/configuration_idefics.py"
+    ],
+    "4_related_elements": {
+        "src/transformers/models/idefics/modeling_idefics.py": [
+            "class: IdeficsGatedCrossAttentionLayer\nclass: IdeficsDecoderLayer\nfunction: _expand_mask\nfunction: IdeficsModel.forward\nfunction: IdeficsForVisionText2Text.forward"
+        ],
+        "src/transformers/models/idefics/processing_idefics.py": [
+            "function: image_attention_mask_for_packed_input_ids\nfunction: incremental_to_binary_attention_mask\nclass: IdeficsProcessor\nvariable: IMAGE_TOKEN"
+        ],
+        "src/transformers/models/idefics/configuration_idefics.py": [
+            "class: IdeficsConfig"
+        ]
+    },
+    "5_sampled_edit_locs_and_patches": [
+        {
+            "sample_index": 0,
+            "edit_locs": {
+                "src/transformers/models/idefics/modeling_idefics.py": [
+                    "function: IdeficsGatedCrossAttentionLayer.forward\nline: 919\nline: 920\nline: 921\nline: 692"
+                ],
+                "src/transformers/models/idefics/processing_idefics.py": [
+                    ""
+                ],
+                "src/transformers/models/idefics/configuration_idefics.py": [
+                    ""
+                ]
+            },
+            "patches": [
+                "diff --git a/src/transformers/models/idefics/modeling_idefics.py b/src/transformers/models/idefics/modeling_idefics.py\nindex a185ba3..b075d8f 100644\n--- a/src/transformers/models/idefics/modeling_idefics.py\n+++ b/src/transformers/models/idefics/modeling_idefics.py\n@@ -917,7 +917,16 @@ class IdeficsGatedCrossAttentionLayer(nn.Module):\n         hidden_states = nn.functional.dropout(hidden_states, p=self.config, training=self.training)\n         # when there are no images the model is used in pure language mode\n         gate = 0 if no_images else 1\n-        hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * hidden_states\n+        # Per-token gating: if a given text position has no valid image keys to attend to,\n+        # its cross-attention contribution should be zero so the residual is unchanged.\n+        if not no_images and image_attention_mask is not None:\n+            # image_attention_mask shape: (bsz, 1, q_len, kv_len), with very negative values for masked positions\n+            # Determine which queries have at least one unmasked key-value to attend to\n+            token_gate = (image_attention_mask > -1e4).any(dim=-1).to(hidden_states.dtype)  # (bsz, 1, q_len)\n+            token_gate = token_gate.squeeze(1).unsqueeze(-1)  # (bsz, q_len, 1)\n+            hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * (hidden_states * token_gate)\n+        else:\n+            hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * hidden_states\n \n         # Fully Connected\n         residual = hidden_states\n",
+                "diff --git a/src/transformers/models/idefics/modeling_idefics.py b/src/transformers/models/idefics/modeling_idefics.py\nindex a185ba3..bd227e8 100644\n--- a/src/transformers/models/idefics/modeling_idefics.py\n+++ b/src/transformers/models/idefics/modeling_idefics.py\n@@ -1246,16 +1246,25 @@ class IdeficsModel(IdeficsPreTrainedModel):\n         # image_attention_mask = torch.zeros(batch_size, seq_length, 1, dtype=torch.long, device=image_hidden_states.device)\n         # Make image_attention_mask compatible with hidden states\n         text_seq_len = image_attention_mask.size(1)\n-        image_attention_mask = image_attention_mask.unsqueeze(-1)\n-        image_attention_mask = image_attention_mask.repeat(1, 1, 1, image_seq_len)\n+        # Repeat the per-token image mask across all image key/value positions\n+        image_attention_mask = image_attention_mask.unsqueeze(-1).repeat(1, 1, 1, image_seq_len)\n         image_attention_mask = image_attention_mask.view(batch_size, text_seq_len, num_images * image_seq_len)\n \n         if image_hidden_states is not None:\n-            image_batch_size, image_sequence_length, _ = image_hidden_states.size()\n-            image_hidden_shape = (image_batch_size, image_sequence_length)\n+            # Convert to a boolean attn_mask for scaled_dot_product_attention:\n+            # True = mask out (no attention), False = keep (allow attention)\n             if image_attention_mask is None:\n-                image_attention_mask = torch.ones(image_hidden_shape, device=device)\n-            image_attention_mask = self.invert_attention_mask(image_attention_mask)\n+                image_attention_mask = torch.zeros(\n+                    (batch_size, text_seq_len, num_images * image_seq_len),\n+                    dtype=torch.bool,\n+                    device=device,\n+                )\n+            else:\n+                # Original mask is expected to be 1 where cross-attention is allowed and 0 otherwise.\n+                # Turn it into a boolean mask with True where attention should be masked.\n+                image_attention_mask = (image_attention_mask == 0)\n+            # Add the required singleton head dimension -> (bsz, 1, q_len, kv_len)\n+            image_attention_mask = image_attention_mask.unsqueeze(1)\n         else:\n             image_attention_mask = None\n \n"
+            ]
+        },
+        {
+            "sample_index": 1,
+            "edit_locs": {
+                "src/transformers/models/idefics/modeling_idefics.py": [
+                    "function: IdeficsAttention.forward\nline: 692\nfunction: IdeficsGatedCrossAttentionLayer.forward\nline: 917\nline: 919\nline: 920\nline: 921\nline: 1248\nline: 1250\nline: 1251\nline: 1252\nline: 1258"
+                ],
+                "src/transformers/models/idefics/processing_idefics.py": [
+                    ""
+                ],
+                "src/transformers/models/idefics/configuration_idefics.py": [
+                    ""
+                ]
+            },
+            "patches": [
+                "diff --git a/src/transformers/models/idefics/modeling_idefics.py b/src/transformers/models/idefics/modeling_idefics.py\nindex a185ba3..7b0b0fe 100644\n--- a/src/transformers/models/idefics/modeling_idefics.py\n+++ b/src/transformers/models/idefics/modeling_idefics.py\n@@ -914,6 +914,20 @@ class IdeficsGatedCrossAttentionLayer(nn.Module):\n             attention_mask=image_attention_mask,\n             output_attentions=output_attentions,\n         )\n+\n+        # For text tokens that appear before any image, the corresponding row in the\n+        # image_attention_mask masks all image keys. In that case, the cross-attention\n+        # contribution should be zero so that the residual remains unchanged.\n+        if image_attention_mask is not None:\n+            # image_attention_mask shape: (bsz, 1, q_len, kv_len)\n+            if image_attention_mask.dtype == torch.bool:\n+                _all_masked = image_attention_mask.all(dim=-1).squeeze(1)  # (bsz, q_len)\n+            else:\n+                # Consider very negative values as masked. Threshold chosen conservatively.\n+                _all_masked = (image_attention_mask < -1e4).all(dim=-1).squeeze(1)  # (bsz, q_len)\n+            if _all_masked.any():\n+                hidden_states = hidden_states.masked_fill(_all_masked.unsqueeze(-1), 0.0)\n+\n         hidden_states = nn.functional.dropout(hidden_states, p=self.config, training=self.training)\n         # when there are no images the model is used in pure language mode\n         gate = 0 if no_images else 1\n",
+                "diff --git a/src/transformers/models/idefics/modeling_idefics.py b/src/transformers/models/idefics/modeling_idefics.py\nindex a185ba3..8363aa2 100644\n--- a/src/transformers/models/idefics/modeling_idefics.py\n+++ b/src/transformers/models/idefics/modeling_idefics.py\n@@ -914,16 +914,27 @@ class IdeficsGatedCrossAttentionLayer(nn.Module):\n             attention_mask=image_attention_mask,\n             output_attentions=output_attentions,\n         )\n-        hidden_states = nn.functional.dropout(hidden_states, p=self.config, training=self.training)\n+        # Compute a per-token gate: 1 if this query has any unmasked image keys, else 0.\n+        if image_attention_mask is not None:\n+            # image_attention_mask shape: (batch, 1, q_len, kv_len), with 0 for allowed, very negative for masked\n+            allowed = (image_attention_mask == 0)\n+            per_token_gate = allowed.any(dim=-1).squeeze(1).to(hidden_states.dtype)  # (batch, q_len)\n+        else:\n+            per_token_gate = torch.ones(hidden_states.size(0), hidden_states.size(1), dtype=hidden_states.dtype, device=hidden_states.device)\n+\n         # when there are no images the model is used in pure language mode\n-        gate = 0 if no_images else 1\n-        hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * hidden_states\n+        if no_images:\n+            per_token_gate = torch.zeros_like(per_token_gate)\n+\n+        hidden_states = nn.functional.dropout(hidden_states, p=self.config.dropout, training=self.training)\n+        # Zero out cross-attention contribution for tokens that should not attend to image embeddings\n+        hidden_states = residual + self.act_cross_attn(self.alpha_cross_attn) * (hidden_states * per_token_gate.unsqueeze(-1))\n \n         # Fully Connected\n         residual = hidden_states\n         hidden_states = self.post_attention_layernorm(hidden_states)\n         hidden_states = self.mlp(hidden_states)\n-        hidden_states = nn.functional.dropout(hidden_states, p=self.config, training=self.training)\n+        hidden_states = nn.functional.dropout(hidden_states, p=self.config.dropout, training=self.training)\n         hidden_states = residual + self.act_dense(self.alpha_dense) * hidden_states\n \n         outputs = (hidden_states,)\n"
+            ]
+        }
+    ],
+    "6_final_selected_patch": "diff --git a/src/transformers/models/idefics/modeling_idefics.py b/src/transformers/models/idefics/modeling_idefics.py\nindex a185ba3..b075d8f 100644\n--- a/src/transformers/models/idefics/modeling_idefics.py\n+++ b/src/transformers/models/idefics/modeling_idefics.py\n@@ -917,7 +917,16 @@ class IdeficsGatedCrossAttentionLayer(nn.Module):\n         hidden_states = nn.functional.dropout(hidden_states, p=self.config, training=self.training)\n         # when there are no images the model is used in pure language mode\n         gate = 0 if no_images else 1\n-        hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * hidden_states\n+        # Per-token gating: if a given text position has no valid image keys to attend to,\n+        # its cross-attention contribution should be zero so the residual is unchanged.\n+        if not no_images and image_attention_mask is not None:\n+            # image_attention_mask shape: (bsz, 1, q_len, kv_len), with very negative values for masked positions\n+            # Determine which queries have at least one unmasked key-value to attend to\n+            token_gate = (image_attention_mask > -1e4).any(dim=-1).to(hidden_states.dtype)  # (bsz, 1, q_len)\n+            token_gate = token_gate.squeeze(1).unsqueeze(-1)  # (bsz, q_len, 1)\n+            hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * (hidden_states * token_gate)\n+        else:\n+            hidden_states = residual + gate * self.act_cross_attn(self.alpha_cross_attn) * hidden_states\n \n         # Fully Connected\n         residual = hidden_states\n"
+}

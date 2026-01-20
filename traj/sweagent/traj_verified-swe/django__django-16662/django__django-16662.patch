@@ -1,0 +1,96 @@
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index a59f0c8dcb..ff63162d70 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -173,9 +173,16 @@ class MigrationWriter:
+         else:
+             imports.add("from django.db import migrations")
+ 
+-        # Sort imports by the package / module to be imported (the part after
+-        # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
++        # Sort imports ensuring that plain 'import' statements come before any
++        # 'from ... import ...' statements, and within each group sort by the
++        # package / module being imported (the part after 'import' or 'from').
++        import_lines = sorted(
++            (i for i in imports if i.startswith("import ")), key=lambda i: i.split()[1]
++        )
++        from_lines = sorted(
++            (i for i in imports if i.startswith("from ")), key=lambda i: i.split()[1]
++        )
++        sorted_imports = import_lines + from_lines
+         items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
+         if migration_imports:
+             items["imports"] += (
+diff --git a/repro_import_order.py b/repro_import_order.py
+new file mode 100644
+index 0000000000..48cafffe90
+--- /dev/null
++++ b/repro_import_order.py
+@@ -0,0 +1,66 @@
++import sys, os, re
++sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
++
++from django.db import migrations, models
++import datetime
++import time
++
++# Construct a migration with operations that produce various imports.
++class DummyMigration(migrations.Migration):
++    initial = True
++    dependencies = []
++    operations = [
++        # Add a DateField with a datetime.date default to force 'import datetime'.
++        migrations.AddField(
++            model_name='mymodel',
++            name='created_at',
++            field=models.DateField(default=datetime.date(2020, 1, 1)),
++        ),
++        # Use RunPython with time.sleep to force 'import time'.
++        migrations.RunPython(time.sleep),
++    ]
++
++if __name__ == '__main__':
++    from django.db.migrations.writer import MigrationWriter
++    m = DummyMigration('0001_initial', 'myapp')
++    s = MigrationWriter(m, include_header=False).as_string()
++    # Extract imports section: it appears at the beginning until the first blank line after imports.
++    # The template puts imports followed by a blank line and the class definition.
++    # We'll print the imports for inspection and check ordering.
++    lines = s.splitlines()
++    # Collect continuous imports section until an empty line.
++    imports = []
++    for line in lines:
++        if not imports:
++            # First lines may be empty if header disabled; but template writes imports at start immediately.
++            pass
++        if line.strip() == '':
++            if imports:
++                break
++            else:
++                continue
++        # Consider only import lines at top until blank line.
++        if line.startswith('from ') or line.startswith('import '):
++            imports.append(line)
++        else:
++            # Stop when non-import encountered after having started collecting.
++            if imports:
++                break
++    print('Generated imports:')
++    for l in imports:
++        print(l)
++    # Check ordering: all plain 'import ' lines must come before any 'from ' imports.
++    saw_from = False
++    error = False
++    for l in imports:
++        if l.startswith('from '):
++            saw_from = True
++        if saw_from and l.startswith('import '):
++            error = True
++            break
++    if error:
++        print('ERROR: Plain import appears after from-import. Ordering incorrect.')
++        sys.exit(1)
++    else:
++        print('OK: Ordering has plain imports before from-imports.')
++        sys.exit(0)

@@ -1,0 +1,147 @@
+diff --git a/repro_property_type_xref.py b/repro_property_type_xref.py
+new file mode 100644
+index 000000000..2763e8367
+--- /dev/null
++++ b/repro_property_type_xref.py
+@@ -0,0 +1,44 @@
++# Reproduction script: demonstrate cross-references in property's type annotations
++# This focuses on the Python domain's parsing of the :type: option for py:property
++# After the fix, the type string is parsed into nodes with pending_xref entries.
++
++from sphinx.domains.python import _parse_annotation
++from sphinx import addnodes
++from docutils import nodes
++
++
++def describe_nodes(nodelist):
++    desc = []
++    for n in nodelist:
++        if isinstance(n, nodes.Text):
++            desc.append(f"Text('{n.astext()}')")
++        elif isinstance(n, addnodes.pending_xref):
++            desc.append(f"pending_xref(reftarget='{n['reftarget']}', reftype='{n['reftype']}')")
++        elif isinstance(n, addnodes.desc_sig_punctuation):
++            desc.append(f"punct('{n.astext()}')")
++        else:
++            desc.append(n.__class__.__name__)
++    return desc
++
++
++def main():
++    # No environment provided: _parse_annotation will still produce pending_xref nodes,
++    # though without context info. That's enough to observe the fix effect.
++    env = None
++
++    samples = [
++        ("Point", "Single class name should create a pending_xref to class 'Point'"),
++        ("Optional[str]", "Generic typing annotation should create xrefs for Optional and str"),
++        ("int | None", "PEP604 union should create xrefs for int and None with '|' punctuation"),
++    ]
++
++    for text, note in samples:
++        nodes_list = _parse_annotation(text, env)
++        print(f"Annotation: {text}\n  {note}")
++        print("  Nodes:")
++        print("   "+", ".join(describe_nodes(nodes_list)))
++        print()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/repro_sphinx_property_type_xref.py b/repro_sphinx_property_type_xref.py
+new file mode 100644
+index 000000000..dff1bad26
+--- /dev/null
++++ b/repro_sphinx_property_type_xref.py
+@@ -0,0 +1,77 @@
++# Reproduce property type annotation cross-reference behavior using Sphinx parsing
++# It sets up a minimal Sphinx app and parses reStructuredText containing py:property
++# The output prints whether type annotation nodes contain pending_xref children.
++
++import os
++import tempfile
++from sphinx.application import Sphinx
++from sphinx.testing import restructuredtext
++from sphinx import addnodes
++from docutils import nodes
++
++
++def find_property_type_nodes(doctree):
++    # Find desc nodes with objtype='property' and return their desc_signature children
++    props = []
++    for node in doctree.traverse(addnodes.desc):
++        if node.get('objtype') == 'property':
++            sig = node[0]  # desc_signature
++            props.append(sig)
++    return props
++
++
++def summarize_type_annotation(sig):
++    # The type annotation is represented as addnodes.desc_annotation appended to signature
++    annos = [child for child in sig if isinstance(child, addnodes.desc_annotation)]
++    summaries = []
++    for anno in annos:
++        parts = []
++        for child in anno:
++            if isinstance(child, nodes.Text):
++                parts.append(f"Text('{child.astext()}')")
++            elif isinstance(child, addnodes.pending_xref):
++                parts.append(f"pending_xref(reftarget='{child['reftarget']}', reftype='{child['reftype']}')")
++            elif isinstance(child, addnodes.desc_sig_punctuation):
++                parts.append(f"punct('{child.astext()}')")
++            elif isinstance(child, addnodes.desc_sig_operator):
++                parts.append(f"op('{child.astext()}')")
++            else:
++                parts.append(child.__class__.__name__)
++        summaries.append(parts)
++    return summaries
++
++
++def main():
++    tmpdir = tempfile.mkdtemp(prefix='sphinx-repro-')
++    confdir = tmpdir
++    outdir = os.path.join(tmpdir, '_build')
++    doctreedir = os.path.join(tmpdir, '_doctree')
++    os.makedirs(outdir, exist_ok=True)
++    os.makedirs(doctreedir, exist_ok=True)
++
++    # Minimal conf.py
++    with open(os.path.join(confdir, 'conf.py'), 'w', encoding='utf-8') as f:
++        f.write('extensions = []\n')
++
++    app = Sphinx(tmpdir, confdir, outdir, doctreedir, buildername='html')
++
++    text = (
++        ".. py:class:: Class\n\n"
++        "   .. py:property:: prop1\n"
++        "      :type: Optional[str]\n\n"
++        "   .. py:property:: prop2\n"
++        "      :type: Class\n"
++    )
++
++    doctree = restructuredtext.parse(app, text)
++    sigs = find_property_type_nodes(doctree)
++    for i, sig in enumerate(sigs, 1):
++        summaries = summarize_type_annotation(sig)
++        print(f"Property {i} type annotation parts:")
++        for parts in summaries:
++            print('  ' + ', '.join(parts))
++        print()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index e8330e81c..9875a9f4b 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -861,7 +861,8 @@ class PyProperty(PyObject):
+ 
+         typ = self.options.get('type')
+         if typ:
+-            signode += addnodes.desc_annotation(typ, ': ' + typ)
++            annotations = _parse_annotation(typ, self.env)
++            signode += addnodes.desc_annotation(typ, '', nodes.Text(': '), *annotations)
+ 
+         return fullname, prefix
+ 

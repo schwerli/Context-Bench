@@ -1,0 +1,70 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 137e6faa0f..effc5e9296 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1631,7 +1631,7 @@ class ModelAdmin(BaseModelAdmin):
+ 
+     def _get_edited_object_pks(self, request, prefix):
+         """Return POST data values of list_editable primary keys."""
+-        pk_pattern = re.compile(r'{}-\d+-{}$'.format(prefix, self.model._meta.pk.name))
++        pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), re.escape(self.model._meta.pk.name)))
+         return [value for key, value in request.POST.items() if pk_pattern.match(key)]
+ 
+     def _get_list_editable_queryset(self, request, prefix):
+diff --git a/scripts/reproduce_admin_prefix_regex.py b/scripts/reproduce_admin_prefix_regex.py
+new file mode 100644
+index 0000000000..82db40c0d5
+--- /dev/null
++++ b/scripts/reproduce_admin_prefix_regex.py
+@@ -0,0 +1,50 @@
++# Reproduce potential data loss in admin changeform view when using regex special characters in formset prefix
++# This script creates a ModelAdmin instance with a dummy model and simulates POST data
++# containing list_editable primary key fields whose formset prefix includes regex special characters.
++# It demonstrates that without escaping, the regex may match unintended keys.
++
++from django.contrib.admin.options import ModelAdmin
++
++class DummyPk:
++    name = 'id'
++
++class DummyMeta:
++    pk = DummyPk()
++    app_label = 'dummyapp'
++    model_name = 'dummymodel'
++    verbose_name_plural = 'Dummy Models'
++
++class DummyModel:
++    _meta = DummyMeta()
++
++class DummyAdminSite:
++    name = 'admin'
++
++class DummyRequest:
++    def __init__(self, post_dict):
++        self.POST = post_dict
++
++# Create a ModelAdmin with the dummy model
++admin = ModelAdmin(DummyModel(), DummyAdminSite())
++
++# Choose a prefix that contains regex special characters. '+' is a quantifier in regex.
++prefix = 'ab+'
++
++# Simulate POST data keys for list_editable pk fields:
++# Intended key that should match: f"{prefix}-0-id" -> 'ab+-0-id'
++# Unintended key that should NOT match: 'ab-0-id' (missing literal '+')
++post_data = {
++    f'{prefix}-0-id': '99',   # correct key/value
++    'ab-0-id': '1',           # incorrect key that may be matched if plus isn't escaped
++    'other-0-id': '123',      # unrelated
++    f'{prefix}-1-id': '100',  # another valid one
++}
++
++request = DummyRequest(post_data)
++
++# Use the private helper to find edited object pks
++pks = admin._get_edited_object_pks(request, prefix)
++print('Extracted PKs:', pks)
++
++# Expected BEFORE fix (buggy behavior): ['99', '1', '100'] because 'ab-0-id' matches 'ab+-\d+-id'
++# Expected AFTER fix (with re.escape on prefix): ['99', '100'] only.
+\ No newline at end of file

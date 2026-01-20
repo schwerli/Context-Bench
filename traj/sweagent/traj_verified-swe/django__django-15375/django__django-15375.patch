@@ -1,0 +1,78 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index 8c4eae7906..95c80cf39e 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -65,7 +65,10 @@ class Aggregate(Func):
+         if hasattr(default, 'resolve_expression'):
+             default = default.resolve_expression(query, allow_joins, reuse, summarize)
+         c.default = None  # Reset the default argument before wrapping.
+-        return Coalesce(c, default, output_field=c._output_field_or_none)
++        coalesce = Coalesce(c, default, output_field=c._output_field_or_none)
++        # Preserve summary flag so aggregation with default works in subqueries.
++        coalesce.is_summary = c.is_summary
++        return coalesce
+ 
+     @property
+     def default_alias(self):
+diff --git a/repro_default_after_annotate.py b/repro_default_after_annotate.py
+new file mode 100644
+index 0000000000..807fd769da
+--- /dev/null
++++ b/repro_default_after_annotate.py
+@@ -0,0 +1,56 @@
++import django
++from django.conf import settings
++
++# Minimal settings
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    SECRET_KEY='test',
++)
++
++django.setup()
++
++from django.db import connection
++from django.db import models
++from django.db.models import F, Sum
++
++# Define a simple model without creating an actual app module by using app_label
++class Book(models.Model):
++    id = models.AutoField(primary_key=True)
++    title = models.CharField(max_length=100, null=True)
++    class Meta:
++        app_label = 'myapp'
++
++# Create table
++with connection.schema_editor() as schema:
++    schema.create_model(Book)
++
++# Insert some rows
++Book.objects.create(title='A')
++Book.objects.create(title='B')
++Book.objects.create(title='C')
++
++print('Count:', Book.objects.count())
++print('Annotate then aggregate without default:')
++print(Book.objects.annotate(idx=F('id')).aggregate(Sum('id')))
++
++print('Annotate then aggregate with default:')
++try:
++    print(Book.objects.annotate(idx=F('id')).aggregate(Sum('id', default=0)))
++except Exception as e:
++    import traceback
++    traceback.print_exc()
++
++
++# Test with empty table
++Book.objects.all().delete()
++print('Count after delete:', Book.objects.count())
++print('Annotate then aggregate with default on empty set:')
++print(Book.objects.annotate(idx=F('id')).aggregate(Sum('id', default=0)))

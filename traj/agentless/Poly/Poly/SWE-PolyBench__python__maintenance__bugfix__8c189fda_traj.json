@@ -1,0 +1,90 @@
+{
+    "instance_id": "SWE-PolyBench__python__maintenance__bugfix__8c189fda",
+    "original_id": "keras-team__keras-18553",
+    "1_model_selected_files": [
+        "keras/backend/torch/nn.py",
+        "keras/ops/nn.py",
+        "keras/ops/operation_utils.py",
+        "keras/backend/common/backend_utils.py",
+        "keras/layers/convolutional/base_depthwise_conv.py"
+    ],
+    "2_embedding_selected_files": [
+        "keras/backend/common/backend_utils_test.py",
+        "keras/backend/common/backend_utils.py",
+        "keras/ops/nn_test.py",
+        "keras/ops/numpy_test.py",
+        "keras/ops/operation_utils_test.py",
+        "keras/backend/jax/nn.py",
+        "keras/ops/numpy.py",
+        "keras/backend/torch/nn.py",
+        "keras/layers/convolutional/depthwise_conv_test.py",
+        "keras/backend/tensorflow/nn.py",
+        "keras/ops/core_test.py",
+        "keras/backend/numpy/nn.py",
+        "keras/legacy/backend.py",
+        "keras/backend/torch/numpy.py",
+        "keras/ops/image_test.py",
+        "keras/ops/math_test.py",
+        "keras/layers/convolutional/conv_transpose_test.py",
+        "keras/layers/pooling/average_pooling_test.py",
+        "keras/layers/convolutional/conv_test.py",
+        "keras/ops/operation_test.py"
+    ],
+    "3_final_combined_files": [
+        "keras/backend/torch/nn.py",
+        "keras/ops/nn.py",
+        "keras/ops/operation_utils.py",
+        "keras/backend/common/backend_utils_test.py",
+        "keras/backend/common/backend_utils.py",
+        "keras/ops/nn_test.py"
+    ],
+    "4_related_elements": {
+        "keras/backend/torch/nn.py": [
+            "function: depthwise_conv\nfunction: conv\nfunction: separable_conv\nfunction: _apply_same_padding\nfunction: _compute_padding_length\nfunction: _transpose_spatial_inputs\nfunction: _transpose_spatial_outputs\nfunction: _transpose_conv_kernel"
+        ],
+        "keras/ops/nn.py": [
+            "class: DepthwiseConv\nfunction: depthwise_conv\nclass: SeparableConv"
+        ],
+        "keras/ops/operation_utils.py": [
+            "function: compute_conv_output_shape"
+        ]
+    },
+    "5_sampled_edit_locs_and_patches": [
+        {
+            "sample_index": 0,
+            "edit_locs": {
+                "keras/backend/torch/nn.py": [
+                    "function: conv"
+                ],
+                "keras/ops/nn.py": [
+                    "function: depthwise_conv\nclass: DepthwiseConv"
+                ],
+                "keras/ops/operation_utils.py": [
+                    "function: compute_conv_output_shape"
+                ]
+            },
+            "patches": [
+                "diff --git a/keras/ops/nn.py b/keras/ops/nn.py\nindex 689cb74..d5c77b8 100644\n--- a/keras/ops/nn.py\n+++ b/keras/ops/nn.py\n@@ -841,6 +841,8 @@ def conv(\n         A tensor of rank N+2, the result of the conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return Conv(strides, padding, data_format, dilation_rate).symbolic_call(\n             inputs, kernel\n@@ -938,6 +940,8 @@ def depthwise_conv(\n         A tensor of rank N+2, the result of the depthwise conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return DepthwiseConv(\n             strides, padding, data_format, dilation_rate\n",
+                "diff --git a/keras/backend/torch/nn.py b/keras/backend/torch/nn.py\nindex 720d0db..0bfe0bc 100644\n--- a/keras/backend/torch/nn.py\n+++ b/keras/backend/torch/nn.py\n@@ -398,6 +398,72 @@ def depthwise_conv(\n     data_format=None,\n     dilation_rate=1,\n ):\n+    inputs = convert_to_tensor(inputs)\n+    kernel = convert_to_tensor(kernel)\n+    num_spatial_dims = inputs.ndim - 2\n+    strides = standardize_tuple(strides, num_spatial_dims, \"strides\")\n+\n+    data_format = standardize_data_format(data_format)\n+    if data_format == \"channels_last\":\n+        inputs = _transpose_spatial_inputs(inputs)\n+\n+    # Prepare depthwise kernel for torch:\n+    # Keras kernel layout: (spatial, in_channels, channel_multiplier)\n+    # Torch expects: (in_channels * channel_multiplier, 1, spatial)\n+    if num_spatial_dims == 1:\n+        k_w = kernel.shape[0]\n+        in_channels = kernel.shape[1]\n+        channel_multiplier = kernel.shape[2]\n+        # (kW, C_in, M) -> (C_in, M, kW) -> (C_in * M, 1, kW)\n+        kernel_t = kernel.permute(1, 2, 0).reshape(\n+            in_channels * channel_multiplier, 1, k_w\n+        )\n+        kernel_spatial = (k_w,)\n+    elif num_spatial_dims == 2:\n+        k_h, k_w = kernel.shape[0], kernel.shape[1]\n+        in_channels = kernel.shape[2]\n+        channel_multiplier = kernel.shape[3]\n+        # (kH, kW, C_in, M) -> (C_in, M, kH, kW) -> (C_in * M, 1, kH, kW)\n+        kernel_t = kernel.permute(2, 3, 0, 1).reshape(\n+            in_channels * channel_multiplier, 1, k_h, k_w\n+        )\n+        kernel_spatial = (k_h, k_w)\n+    else:\n+        raise ValueError(\n+            \"Depthwise conv supports only 1D and 2D inputs. \"\n+            f\"Received input ndim={inputs.ndim}.\"\n+        )\n+\n+    if padding == \"same\":\n+        inputs = _apply_same_padding(\n+            inputs,\n+            kernel_spatial,\n+            strides,\n+            operation_type=\"conv\",\n+            dilation_rate=dilation_rate,\n+        )\n+\n+    groups = in_channels\n+    if num_spatial_dims == 1:\n+        outputs = tnn.conv1d(\n+            inputs,\n+            kernel_t,\n+            stride=strides,\n+            dilation=dilation_rate,\n+            groups=groups,\n+        )\n+    else:\n+        outputs = tnn.conv2d(\n+            inputs,\n+            kernel_t,\n+            stride=strides,\n+            dilation=dilation_rate,\n+            groups=groups,\n+        )\n+\n+    if data_format == \"channels_last\":\n+        outputs = _transpose_spatial_outputs(outputs)\n+    return outputs\n     kernel = convert_to_tensor(kernel)\n     kernel = torch.reshape(\n         kernel, kernel.shape[:-2] + (1, kernel.shape[-2] * kernel.shape[-1])\n"
+            ]
+        },
+        {
+            "sample_index": 1,
+            "edit_locs": {
+                "keras/backend/torch/nn.py": [
+                    "function: conv"
+                ],
+                "keras/ops/nn.py": [
+                    "function: conv\nfunction: depthwise_conv\nfunction: DepthwiseConv.__init__"
+                ],
+                "keras/ops/operation_utils.py": [
+                    "function: compute_conv_output_shape"
+                ]
+            },
+            "patches": [
+                "diff --git a/keras/backend/torch/nn.py b/keras/backend/torch/nn.py\nindex 720d0db..5bc3842 100644\n--- a/keras/backend/torch/nn.py\n+++ b/keras/backend/torch/nn.py\n@@ -333,6 +333,8 @@ def conv(\n     strides = standardize_tuple(strides, num_spatial_dims, \"strides\")\n \n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if data_format == \"channels_last\":\n         inputs = _transpose_spatial_inputs(inputs)\n     # Transpose kernel from keras format to torch format.\ndiff --git a/keras/ops/nn.py b/keras/ops/nn.py\nindex 689cb74..d5c77b8 100644\n--- a/keras/ops/nn.py\n+++ b/keras/ops/nn.py\n@@ -841,6 +841,8 @@ def conv(\n         A tensor of rank N+2, the result of the conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return Conv(strides, padding, data_format, dilation_rate).symbolic_call(\n             inputs, kernel\n@@ -938,6 +940,8 @@ def depthwise_conv(\n         A tensor of rank N+2, the result of the depthwise conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return DepthwiseConv(\n             strides, padding, data_format, dilation_rate\n"
+            ]
+        }
+    ],
+    "6_final_selected_patch": "diff --git a/keras/ops/nn.py b/keras/ops/nn.py\nindex 689cb74..d5c77b8 100644\n--- a/keras/ops/nn.py\n+++ b/keras/ops/nn.py\n@@ -841,6 +841,8 @@ def conv(\n         A tensor of rank N+2, the result of the conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return Conv(strides, padding, data_format, dilation_rate).symbolic_call(\n             inputs, kernel\n@@ -938,6 +940,8 @@ def depthwise_conv(\n         A tensor of rank N+2, the result of the depthwise conv operation.\n     \"\"\"\n     data_format = standardize_data_format(data_format)\n+    if isinstance(padding, str):\n+        padding = padding.lower()\n     if any_symbolic_tensors((inputs,)):\n         return DepthwiseConv(\n             strides, padding, data_format, dilation_rate\n"
+}

@@ -1,0 +1,112 @@
+diff --git a/django/core/serializers/python.py b/django/core/serializers/python.py
+index 36048601af..6a7c249f38 100644
+--- a/django/core/serializers/python.py
++++ b/django/core/serializers/python.py
+@@ -76,10 +76,15 @@ class Serializer(base.Serializer):
+             else:
+ 
+                 def m2m_value(value):
+-                    return self._value_from_field(value, value._meta.pk)
++                    # Support both model instances and raw primary key values.
++                    if isinstance(value, models.Model):
++                        return self._value_from_field(value, value._meta.pk)
++                    return value
+ 
+                 def queryset_iterator(obj, field):
+-                    return getattr(obj, field.name).only("pk").iterator()
++                    # Use values_list to avoid combining only() with managers that
++                    # add select_related() which can cause FieldError when serializing.
++                    return getattr(obj, field.name).values_list("pk", flat=True).iterator()
+ 
+             m2m_iter = getattr(obj, "_prefetched_objects_cache", {}).get(
+                 field.name,
+diff --git a/repro_m2m_select_related.py b/repro_m2m_select_related.py
+new file mode 100644
+index 0000000000..4ec61c743e
+--- /dev/null
++++ b/repro_m2m_select_related.py
+@@ -0,0 +1,46 @@
++import django
++from django.conf import settings
++from django.core import serializers
++
++# Configure minimal settings
++settings.configure(
++    INSTALLED_APPS=['reproapp'],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++)
++
++django.setup()
++
++from django.db import connection
++from reproapp.models import TestTagMaster, TestTag, Test
++
++# Create database tables for the models
++with connection.schema_editor() as editor:
++    editor.create_model(TestTagMaster)
++    editor.create_model(TestTag)
++    editor.create_model(Test)
++
++# Create sample data
++
++tag_master = TestTagMaster.objects.create(name="master")
++tag = TestTag.objects.create(name="tag", master=tag_master)
++test = Test.objects.create(name="test")
++
++test.tags.add(tag)
++
++test.save()
++
++# Try to serialize
++print("Attempting to serialize Test instance with M2M tags...")
++try:
++    data = serializers.serialize("json", [test])
++    print("Serialization succeeded. Output:")
++    print(data)
++except Exception as e:
++    # Print full exception type and message
++    import traceback
++    traceback.print_exc()
+diff --git a/reproapp/__init__.py b/reproapp/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/reproapp/apps.py b/reproapp/apps.py
+new file mode 100644
+index 0000000000..12d5079cbf
+--- /dev/null
++++ b/reproapp/apps.py
+@@ -0,0 +1,5 @@
++from django.apps import AppConfig
++
++class ReproappConfig(AppConfig):
++    default_auto_field = 'django.db.models.AutoField'
++    name = 'reproapp'
+diff --git a/reproapp/models.py b/reproapp/models.py
+new file mode 100644
+index 0000000000..c51d172c26
+--- /dev/null
++++ b/reproapp/models.py
+@@ -0,0 +1,18 @@
++from django.db import models
++
++class TestTagManager(models.Manager):
++    def get_queryset(self):
++        qs = super().get_queryset()
++        return qs.select_related("master")
++
++class TestTagMaster(models.Model):
++    name = models.CharField(max_length=120)
++
++class TestTag(models.Model):
++    objects = TestTagManager()
++    name = models.CharField(max_length=120)
++    master = models.ForeignKey(TestTagMaster, on_delete=models.SET_NULL, null=True)
++
++class Test(models.Model):
++    name = models.CharField(max_length=120)
++    tags = models.ManyToManyField(TestTag, blank=True)

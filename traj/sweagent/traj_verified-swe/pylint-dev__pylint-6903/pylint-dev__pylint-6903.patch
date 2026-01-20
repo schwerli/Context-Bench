@@ -1,0 +1,139 @@
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+index a7e5d557..6c697f76 100644
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -52,12 +52,12 @@ def _query_cpu() -> int | None:
+         with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as file:
+             cpu_period = int(file.read().rstrip())
+         # Divide quota by period and you should get num of allotted CPU to the container, rounded down if fractional.
+-        avail_cpu = int(cpu_quota / cpu_period)
++        avail_cpu = int(cpu_quota / cpu_period) or 1
+     elif Path("/sys/fs/cgroup/cpu/cpu.shares").is_file():
+         with open("/sys/fs/cgroup/cpu/cpu.shares", encoding="utf-8") as file:
+             cpu_shares = int(file.read().rstrip())
+         # For AWS, gives correct value * 1024.
+-        avail_cpu = int(cpu_shares / 1024)
++        avail_cpu = int(cpu_shares / 1024) or 1
+     return avail_cpu
+ 
+ 
+diff --git a/repro_cpu_jobs_zero.py b/repro_cpu_jobs_zero.py
+new file mode 100644
+index 00000000..689143cd
+--- /dev/null
++++ b/repro_cpu_jobs_zero.py
+@@ -0,0 +1,114 @@
++import multiprocessing
++import builtins
++from unittest.mock import patch
++from pathlib import Path
++import os
++
++# 1) Simulate pre-fix error: creating a multiprocessing.Pool with 0 processes crashes
++print("Simulating pre-fix behavior: creating Pool(processes=0) should raise ValueError...")
++try:
++    multiprocessing.Pool(0)
++except Exception as e:
++    print("Caught expected exception:", type(e).__name__, str(e))
++
++# 2) Now simulate Kubernetes cgroup values that cause cpu.shares=2 -> int(2/1024) == 0
++#    We'll patch Path.is_file and builtins.open so that pylint.lint.run._query_cpu reads those values.
++
++from pylint.lint.run import _cpu_count
++
++CPU_QUOTA_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
++CPU_PERIOD_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
++CPU_SHARES_PATH = "/sys/fs/cgroup/cpu/cpu.shares"
++
++values = {
++    CPU_QUOTA_PATH: "-1\n",  # should make quota branch inactive
++    CPU_PERIOD_PATH: "100000\n",
++    CPU_SHARES_PATH: "2\n",  # leads to int(2/1024) == 0 without the fix
++}
++
++# Custom open that returns our desired content for the cgroup files
++class FauxFile:
++    def __init__(self, content):
++        self._content = content
++    def read(self):
++        return self._content
++    def __enter__(self):
++        return self
++    def __exit__(self, exc_type, exc, tb):
++        return False
++    def rstrip(self, *args, **kwargs):
++        # Not used directly, file.read().rstrip() is used
++        return self._content.rstrip(*args, **kwargs)
++
++
++def faux_open(path, *args, **kwargs):
++    if path in values:
++        return FauxFile(values[path])
++    # Delegate to real open otherwise
++    return real_open(path, *args, **kwargs)
++
++# is_file should return True for our three paths
++
++def faux_is_file(self):
++    p = str(self)
++    if p in values:
++        return True
++    return real_is_file(self)
++
++real_open = builtins.open
++real_is_file = Path.is_file
++
++print("Simulating Kubernetes cgroup environment with cpu.shares=2...")
++with patch.object(builtins, "open", side_effect=faux_open):
++    with patch.object(Path, "is_file", new=lambda self: (str(self) in values) or real_is_file(self)):
++        # Force using multiprocessing.cpu_count by disabling sched_getaffinity, to avoid environment variance
++        real_sched_getaffinity = getattr(os, "sched_getaffinity", None)
++        try:
++            if hasattr(os, "sched_getaffinity"):
++                del os.sched_getaffinity
++        except Exception:
++            pass
++        try:
++            count = _cpu_count()
++            print("_cpu_count() under simulated cgroups:", count)
++            # Try creating a Pool with that count to ensure it's valid (>=1)
++            print("Creating Pool(processes=%d)..." % count)
++            p = multiprocessing.Pool(count)
++            p.close()
++            p.join()
++            print("Pool created and closed successfully.")
++        finally:
++            # restore sched_getaffinity
++            if real_sched_getaffinity is not None:
++                os.sched_getaffinity = real_sched_getaffinity
++
++# 3) Test the cfs quota/period branch where int(quota/period) would be 0
++values = {
++    CPU_QUOTA_PATH: "50000\n",  # quota less than period
++    CPU_PERIOD_PATH: "100000\n",
++    CPU_SHARES_PATH: "0\n",  # ensure shares branch won't be used
++}
++
++print("Simulating cgroups with quota/period yielding <1 CPU...")
++with patch.object(builtins, "open", side_effect=faux_open):
++    with patch.object(Path, "is_file", new=lambda self: (str(self) in values) or real_is_file(self)):
++        # disable sched_getaffinity again to avoid differing env
++        real_sched_getaffinity = getattr(os, "sched_getaffinity", None)
++        try:
++            if hasattr(os, "sched_getaffinity"):
++                del os.sched_getaffinity
++        except Exception:
++            pass
++        try:
++            count = _cpu_count()
++            print("_cpu_count() under quota/period simulated cgroups:", count)
++            print("Creating Pool(processes=%d)..." % count)
++            p = multiprocessing.Pool(count)
++            p.close()
++            p.join()
++            print("Pool created and closed successfully under quota/period simulation.")
++        finally:
++            if real_sched_getaffinity is not None:
++                os.sched_getaffinity = real_sched_getaffinity
++
++print("Done.")

@@ -1,0 +1,68 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index ad2f5a7da1..586cd1a4a0 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -1251,7 +1251,9 @@ class BaseDatabaseSchemaEditor:
+         else:
+             sql = self.sql_create_unique
+         if columns:
+-            columns = self._index_columns(table, columns, col_suffixes=(), opclasses=opclasses)
++            # Pass the table name string to _index_columns to ensure Columns
++            # receives a string and can correctly report references_column.
++            columns = self._index_columns(model._meta.db_table, columns, col_suffixes=(), opclasses=opclasses)
+         else:
+             columns = Expressions(model._meta.db_table, expressions, compiler, self.quote_value)
+         return Statement(
+diff --git a/repro_unique_stmt.py b/repro_unique_stmt.py
+new file mode 100644
+index 0000000000..09ae520cf4
+--- /dev/null
++++ b/repro_unique_stmt.py
+@@ -0,0 +1,47 @@
++import django
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={
++            'default': {
++                'ENGINE': 'django.db.backends.sqlite3',
++                'NAME': ':memory:',
++            }
++        },
++        SECRET_KEY='test',
++    )
++
++django.setup()
++
++from django.db import connection, models
++
++class TestModel(models.Model):
++    name = models.CharField(max_length=50, unique=False)
++    class Meta:
++        app_label = 'myapp'
++
++# Use schema editor to create table and generate unique statement
++with connection.schema_editor() as editor:
++    editor.create_model(TestModel)
++    # Grab the field
++    field = TestModel._meta.get_field('name')
++    # Build a unique SQL Statement using the private API
++    stmt = editor._create_unique_sql(TestModel, [field.column], name='uniq_name_idx')
++    # Check references_column
++    table_name = TestModel._meta.db_table
++    print('Table name:', table_name)
++    print('Column name:', field.column)
++    print('Statement:', stmt)
++    print('references_table=', stmt.references_table(table_name))
++    print('references_column=', stmt.references_column(table_name, field.column))
++
++# Simulate rename of column reference inside Statement
++stmt.rename_column_references(table_name, field.column, 'renamed_col')
++print('After rename, references_column(original)=', stmt.references_column(table_name, field.column))
++print('After rename, references_column(renamed)=', stmt.references_column(table_name, 'renamed_col'))
++print('Statement after rename:', stmt)

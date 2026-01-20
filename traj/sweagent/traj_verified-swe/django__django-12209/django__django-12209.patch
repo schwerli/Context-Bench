@@ -1,0 +1,100 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index e3b14a41a0..9445eebf72 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -839,7 +839,9 @@ class Model(metaclass=ModelBase):
+             non_pks = [f for f in non_pks
+                        if f.name in update_fields or f.attname in update_fields]
+ 
+-        pk_val = self._get_pk_val(meta)
++        # Determine if a primary key was explicitly set prior to save.
++        original_pk_val = self._get_pk_val(meta)
++        pk_val = original_pk_val
+         if pk_val is None:
+             pk_val = meta.pk.get_pk_value_on_save(self)
+             setattr(self, meta.pk.attname, pk_val)
+@@ -847,12 +849,14 @@ class Model(metaclass=ModelBase):
+         if not pk_set and (force_update or update_fields):
+             raise ValueError("Cannot force an update in save() with no primary key.")
+         updated = False
+-        # Skip an UPDATE when adding an instance and primary key has a default.
++        # Skip an UPDATE when adding an instance and primary key has a default,
++        # but only if an explicit primary key wasn't provided on the instance.
+         if (
+             not force_insert and
+             self._state.adding and
+             self._meta.pk.default and
+-            self._meta.pk.default is not NOT_PROVIDED
++            self._meta.pk.default is not NOT_PROVIDED and
++            original_pk_val is None
+         ):
+             force_insert = True
+         # If possible, try an UPDATE. If that doesn't update anything, do an INSERT.
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..c77b112a87
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,62 @@
++import sys
++from uuid import uuid4
++
++from django.conf import settings
++
++# Configure minimal settings
++if not settings.configured:
++    settings.configure(
++        INSTALLED_APPS=[
++            'django.contrib.contenttypes',
++        ],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++        USE_TZ=True,
++    )
++
++import django
++from django.apps import apps
++from django.db import connection, IntegrityError
++from django.db import models
++
++django.setup()
++
++class Sample(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid4)
++    name = models.CharField(blank=True, max_length=100)
++
++    class Meta:
++        app_label = 'myapp'
++
++# Register the model with the app registry
++apps.register_model('myapp', Sample)
++
++# Create DB table for the model
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(Sample)
++
++# Reproduce sequence from PR description
++try:
++    s0 = Sample.objects.create()
++    s1 = Sample(pk=s0.pk, name='Test 1')
++    print('About to save s1 with explicit pk:', s1.pk)
++    s1.save()
++    print('Saved s1 successfully')
++except IntegrityError as e:
++    print('IntegrityError occurred:', e)
++    print('This indicates an attempted INSERT instead of UPDATE when saving with explicit pk.')
++
++# Show resulting records
++print('Count after s1.save():', Sample.objects.count())
++print('Names after s1.save():', list(Sample.objects.values_list('name', flat=True)))
++
++# Now test explicit pk with default present but object doesn't exist
++s2 = Sample(pk=uuid4(), name='New')
++print('About to save s2 with explicit non-existing pk:', s2.pk)
++try:
++    s2.save()
++    print('Saved s2 successfully (should be INSERT)')
++except IntegrityError as e:
++    print('IntegrityError for s2:', e)
++
++print('Final Count:', Sample.objects.count())
++print('Final Names:', sorted(list(Sample.objects.values_list('name', flat=True))))

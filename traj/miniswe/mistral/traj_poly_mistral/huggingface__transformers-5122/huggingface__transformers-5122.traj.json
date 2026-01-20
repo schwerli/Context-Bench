@@ -1,0 +1,1613 @@
+{
+  "info": {
+    "exit_status": "Submitted",
+    "submission": "diff --git a/Dockerfile b/Dockerfile\nnew file mode 100644\nindex 00000000..803adf79\n--- /dev/null\n+++ b/Dockerfile\n@@ -0,0 +1,31 @@\n+FROM public.ecr.aws/docker/library/python:3.8-slim\n+\n+RUN apt-get update && apt-get install -y git git-lfs && rm -rf /var/lib/apt/lists/*\n+\n+RUN git lfs install\n+WORKDIR /testbed\n+\n+# Install system dependencies\n+RUN apt-get update && apt-get install -y \\\n+    git \\\n+    build-essential \\\n+    && rm -rf /var/lib/apt/lists/*\n+\n+# Copy the repository contents\n+COPY . .\n+\n+\n+# Download model manually\n+RUN git clone https://huggingface.co/google-bert/bert-base-cased-finetuned-mrpc bert-base-cased-finetuned-mrpc\n+\n+\n+# Install Python dependencies\n+RUN pip install --no-cache-dir --upgrade pip\n+RUN pip install --no-cache-dir --retries 3 -e .[testing,torch] pytest\n+RUN pip install --no-cache-dir --retries 3 tensorflow\n+\n+# Set environment variables\n+ENV PYTHONPATH=/testbed\n+ENV TRANSFORMERS_CACHE=/testbed/.cache\n+\n+# Run the specified test file\n\\ No newline at end of file\ndiff --git a/bert-base-cased-finetuned-mrpc b/bert-base-cased-finetuned-mrpc\nnew file mode 160000\nindex 00000000..f150c1d6\n--- /dev/null\n+++ b/bert-base-cased-finetuned-mrpc\n@@ -0,0 +1 @@\n+Subproject commit f150c1d609d1e50dd5e2e5408661cfac8339277c\ndiff --git a/src/transformers/data/data_collator.py b/src/transformers/data/data_collator.py\nindex 5e014d33..ef959f8e 100644\n--- a/src/transformers/data/data_collator.py\n+++ b/src/transformers/data/data_collator.py\n@@ -43,14 +43,24 @@ def default_data_collator(features: List[InputDataClass]) -> Dict[str, torch.Ten\n     # Ensure that tensor is created with the correct type\n     # (it should be automatically the case, but let's make sure of it.)\n     if \"label\" in first:\n-        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n-        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n+        # Check if all labels are None (e.g., for test set prediction)\n+        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n+            # Don't add labels to batch if all are None\n+            pass\n+        else:\n+            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n+            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n     elif \"label_ids\" in first:\n-        if isinstance(first[\"label_ids\"], torch.Tensor):\n-            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n+        # Check if all label_ids are None (e.g., for test set prediction)\n+        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n+            # Don't add labels to batch if all are None\n+            pass\n         else:\n-            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n-            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n+            if isinstance(first[\"label_ids\"], torch.Tensor):\n+                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n+            else:\n+                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n+                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n \n     # Handling of all other possible keys.\n     # Again, we will use the first element to figure out which key/values are not None for this model.\ndiff --git a/test_edge_cases.py b/test_edge_cases.py\nnew file mode 100644\nindex 00000000..31d2cb11\n--- /dev/null\n+++ b/test_edge_cases.py\n@@ -0,0 +1,38 @@\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Edge case 1: Mixed None and non-None labels (should probably fail or handle gracefully)\n+features_mixed_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": 1},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+# Edge case 2: label_ids with None values\n+features_none_label_ids = [\n+    {\"input_ids\": [1, 2, 3], \"label_ids\": None},\n+    {\"input_ids\": [4, 5, 6], \"label_ids\": None},\n+]\n+\n+# Edge case 3: Empty features list (edge case)\n+features_empty = []\n+\n+print(\"Testing edge case 1: Mixed None and non-None labels\")\n+try:\n+    result = default_data_collator(features_mixed_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting edge case 2: None label_ids\")\n+try:\n+    result = default_data_collator(features_none_label_ids)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting edge case 3: Empty features list\")\n+try:\n+    result = default_data_collator(features_empty)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_final_verification.py b/test_final_verification.py\nnew file mode 100644\nindex 00000000..fbff1f14\n--- /dev/null\n+++ b/test_final_verification.py\n@@ -0,0 +1,76 @@\n+\"\"\"\n+Final verification test for the data collator fix.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+print(\"=\" * 60)\n+print(\"FINAL VERIFICATION TEST\")\n+print(\"=\" * 60)\n+\n+# Test 1: Normal case with integer labels\n+print(\"\\n1. Testing with integer labels:\")\n+features_int = [{\"input_ids\": [1, 2], \"label\": 1}, {\"input_ids\": [3, 4], \"label\": 0}]\n+try:\n+    batch = default_data_collator(features_int)\n+    assert \"labels\" in batch\n+    assert torch.equal(batch[\"labels\"], torch.tensor([1, 0]))\n+    print(\"   \u2713 PASS - Integer labels work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 2: Normal case with float labels\n+print(\"\\n2. Testing with float labels:\")\n+features_float = [{\"input_ids\": [1, 2], \"label\": 1.5}, {\"input_ids\": [3, 4], \"label\": 0.5}]\n+try:\n+    batch = default_data_collator(features_float)\n+    assert \"labels\" in batch\n+    assert torch.allclose(batch[\"labels\"], torch.tensor([1.5, 0.5]))\n+    print(\"   \u2713 PASS - Float labels work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 3: None labels (test set scenario)\n+print(\"\\n3. Testing with None labels (test set):\")\n+features_none = [{\"input_ids\": [1, 2], \"label\": None}, {\"input_ids\": [3, 4], \"label\": None}]\n+try:\n+    batch = default_data_collator(features_none)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - None labels handled correctly (key excluded)\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 4: No label key at all\n+print(\"\\n4. Testing without label key:\")\n+features_no_label = [{\"input_ids\": [1, 2]}, {\"input_ids\": [3, 4]}]\n+try:\n+    batch = default_data_collator(features_no_label)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - No label key handled correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 5: None label_ids\n+print(\"\\n5. Testing with None label_ids:\")\n+features_none_ids = [{\"input_ids\": [1, 2], \"label_ids\": None}, {\"input_ids\": [3, 4], \"label_ids\": None}]\n+try:\n+    batch = default_data_collator(features_none_ids)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - None label_ids handled correctly (key excluded)\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 6: Normal label_ids\n+print(\"\\n6. Testing with normal label_ids:\")\n+features_ids = [{\"input_ids\": [1, 2], \"label_ids\": [1, 0]}, {\"input_ids\": [3, 4], \"label_ids\": [0, 1]}]\n+try:\n+    batch = default_data_collator(features_ids)\n+    assert \"labels\" in batch\n+    assert torch.equal(batch[\"labels\"], torch.tensor([[1, 0], [0, 1]]))\n+    print(\"   \u2713 PASS - Normal label_ids work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+print(\"\\n\" + \"=\" * 60)\n+print(\"VERIFICATION COMPLETE\")\n+print(\"=\" * 60)\ndiff --git a/test_glue_scenario.py b/test_glue_scenario.py\nnew file mode 100644\nindex 00000000..56abc8e7\n--- /dev/null\n+++ b/test_glue_scenario.py\n@@ -0,0 +1,34 @@\n+\"\"\"\n+Test script to simulate the GLUE test set prediction scenario described in the PR.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Simulate GLUE test dataset features (no labels)\n+glue_test_features = [\n+    {\n+        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n+        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n+        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n+        \"label\": None  # Test set has no labels\n+    },\n+    {\n+        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n+        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n+        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n+        \"label\": None  # Test set has no labels\n+    },\n+]\n+\n+print(\"Testing GLUE test set scenario (None labels):\")\n+try:\n+    batch = default_data_collator(glue_test_features)\n+    print(\"SUCCESS!\")\n+    print(\"Batch keys:\", list(batch.keys()))\n+    print(\"Has 'labels' key:\", \"labels\" in batch)\n+    if \"labels\" not in batch:\n+        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n+    else:\n+        print(\"\u2717 Unexpectedly included 'labels' key\")\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_glue_simple.py b/test_glue_simple.py\nnew file mode 100644\nindex 00000000..facbf751\n--- /dev/null\n+++ b/test_glue_simple.py\n@@ -0,0 +1,25 @@\n+\"\"\"\n+Simple test for None labels in GLUE scenario.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Simple test with None labels\n+test_features = [\n+    {\"input_ids\": [1, 2, 3], \"label\": None},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+print(\"Testing simple None labels scenario:\")\n+try:\n+    batch = default_data_collator(test_features)\n+    print(\"SUCCESS!\")\n+    print(\"Batch keys:\", list(batch.keys()))\n+    print(\"Has 'labels' key:\", \"labels\" in batch)\n+    if \"labels\" not in batch:\n+        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n+    else:\n+        print(\"\u2717 Unexpectedly included 'labels' key\")\n+        print(\"Labels:\", batch[\"labels\"])\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_reproduce_issue.py b/test_reproduce_issue.py\nnew file mode 100644\nindex 00000000..1ff23a85\n--- /dev/null\n+++ b/test_reproduce_issue.py\n@@ -0,0 +1,41 @@\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Test case 1: Normal case with labels\n+features_with_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": 1},\n+    {\"input_ids\": [4, 5, 6], \"label\": 0},\n+]\n+\n+# Test case 2: Test set case with None labels (this should fail with current code)\n+features_with_none_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": None},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+# Test case 3: Features without label key\n+features_without_labels = [\n+    {\"input_ids\": [1, 2, 3]},\n+    {\"input_ids\": [4, 5, 6]},\n+]\n+\n+print(\"Testing case 1: Features with labels\")\n+try:\n+    result = default_data_collator(features_with_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting case 2: Features with None labels (test set)\")\n+try:\n+    result = default_data_collator(features_with_none_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting case 3: Features without label key\")\n+try:\n+    result = default_data_collator(features_without_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n",
+    "model_stats": {
+      "instance_cost": 0.20760199999999995,
+      "api_calls": 38
+    },
+    "mini_version": "1.17.3",
+    "config": {
+      "agent": {
+        "system_template": "You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.\nYour response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).\n\nInclude a THOUGHT section before your command where you explain your reasoning process.\nFormat your response as shown in <format_example>.\n\n<format_example>\nTHOUGHT: Your reasoning and analysis here\n\n```bash\nyour_command_here\n```\n</format_example>\n\nFailure to follow these rules will cause your response to be rejected.\n",
+        "instance_template": "<pr_description>\nConsider the following PR description:\n{{task}}\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting commands.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\nFor each response:\n1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish\n2. Provide exactly ONE bash command to execute\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, project configuration files (e.g., build configs, lockfiles, CI configs), or environment setup unless the PR description explicitly requires it.\n\n## Recommended Workflow\n1. Analyze the codebase by finding and reading relevant files\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Test edge cases to ensure your fix is robust\n\n## Command Execution Rules\nYou are operating in an environment where\n1. You write a single command\n2. The system executes that command in a subshell\n3. You see the result\n4. You write your next command\n\nEach response should include:\n1. A **THOUGHT** section where you explain your reasoning and plan\n2. A single bash code block with your command\n\nFormat your responses like this:\n\n<format_example>\nTHOUGHT: Here I explain my reasoning process, analysis of the current situation,\nand what I'm trying to accomplish with the command below.\n\n```bash\nyour_command_here\n```\n</format_example>\n\n**CRITICAL REQUIREMENTS:**\n- Your response SHOULD include a THOUGHT section explaining your reasoning\n- Your response MUST include EXACTLY ONE bash code block\n- This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)\n- If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL\n- Do NOT try to run multiple independent commands in separate blocks in one response\n- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.\n- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files\n\n## Explore-context Marking (STRICT, REQUIRED FOR FILE READING)\nWhen you are exploring code context (reading files / printing line ranges), you MUST include a machine-parseable\nexplore-context block BEFORE your bash code block. This is independent of the command you use (cat/sed/nl/head/etc).\n\n**When NOT to include `<EXPLORE_CONTEXT>`:**\n- Do NOT include it for non-reading exploration like `ls -la`, `find`, `rg/grep` (search-only), `git status`, etc.\n- Only include it when your command will PRINT actual source code content (a file snippet / line range) to stdout\n  for you to read.\n\n**Explore-context block format (STRICT):**\n- MUST be enclosed in `<EXPLORE_CONTEXT> ... </EXPLORE_CONTEXT>` tags.\n- Inside, include ONE OR MORE entries, each entry exactly:\n  `File: /absolute/path/to/file.ext`\n  `Lines: <start>-<end>`\n- Multiple entries are separated by a blank line.\n- Use ABSOLUTE paths only.\n- `<start>` and `<end>` MUST be positive integers and `<start> <= <end>`.\n- Do NOT include any other text (no explanation, no code, no extra keys).\n\n**Command/output consistency (STRICT):**\nYour bash command MUST print the declared file line range(s) to stdout (the terminal output we see),\nso we can map `<EXPLORE_CONTEXT>` entries to the observed `<output>` content.\n\n**Good examples:**\n<EXPLORE_CONTEXT>\nFile: /testbed/src/foo.py\nLines: 10-40\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/foo.py | sed -n '10,40p'\n```\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/a.py\nLines: 1-80\n\nFile: /testbed/src/b.py\nLines: 120-160\n</EXPLORE_CONTEXT>\n\n```bash\n(nl -ba /testbed/src/a.py | sed -n '1,80p' && echo '---' && nl -ba /testbed/src/b.py | sed -n '120,160p')\n```\n\n## Environment Details\n- You have a full Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n- If a command isn't available, you can install it\n\n## Useful Command Examples\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.txt\nhello world\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following command:\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\nThis command will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>\n",
+        "timeout_template": "The last command <command>{{action['action']}}</command> timed out and has been killed.\nThe output of the command was:\n{% if output | length < 10000 -%}\n<output>\n{{output}}\n</output>\n{%- else -%}\n<warning>Output was too long and has been truncated.</warning>\n<output_head>\n{{ output[:5000] }}\n</output_head>\n<elided_chars>{{ output | length - 10000 }} characters elided</elided_chars>\n<output_tail>\n{{ output[-5000:] }}\n</output_tail>\n{%- endif %}\nPlease try another command and make sure to avoid those requiring interactive input.\n",
+        "format_error_template": "Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).\n",
+        "action_observation_template": "{% if explore_context -%}\n<explore_context>\n{{ explore_context -}}\n</explore_context>\n{%- endif %}\n<returncode>{{output.returncode}}</returncode>\n{% if output.output | length < 10000 -%}\n<output>\n{{ output.output -}}\n</output>\n{%- else -%}\n<warning>\nThe output of your last command was too long.\nPlease try a different command that produces less output.\nIf you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.\nIf you're using grep or find and it produced too much output, you can use a more selective search pattern.\nIf you really need to see something from the full command's output, you can redirect output to a file and then search in that file.\n</warning>\n{%- set elided_chars = output.output | length - 10000 -%}\n<output_head>\n{{ output.output[:5000] }}\n</output_head>\n<elided_chars>\n{{ elided_chars }} characters elided\n</elided_chars>\n<output_tail>\n{{ output.output[-5000:] }}\n</output_tail>\n{%- endif -%}\n",
+        "context_request_template": "<context_request>\nBefore finalizing your submission, please provide the CODE CONTEXT you used to generate the patch.\n\n**Requirements:**\nList ONLY the specific code sections from source files that you examined to create your patch.\n\n**Format (strictly follow):**\nEach entry must include:\n- File: <absolute_file_path>\n- Lines: <start_line>-<end_line>\n\n**Example:**\n\nFile: /testbed/src/core/handler.ext\nLines: 34-56\n\nFile: /testbed/lib/utils.ext\nLines: 128-145\n\nFile: /testbed/src/parser.ext\nLines: 67-89\n\n**DO NOT include:**\n- Explanations, reasoning, or commentary\n- Error messages or debugging output\n- Test code or test results\n- Documentation or comments\n- Any non-code content\n\nPlease format your response as:\n\nTHOUGHT: Providing code context used for patch generation.\n\n<PATCH_CONTEXT>\nFile: <absolute_file_path>\nLines: <start_line>-<end_line>\n\nFile: <absolute_file_path>\nLines: <start_line>-<end_line>\n</PATCH_CONTEXT>\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\n**CRITICAL:** Provide ONLY file paths and line ranges (no code snippets, no explanations) within <PATCH_CONTEXT> tags.\n</context_request>\n",
+        "context_confirmation_template": "<context_received>\nContext received and recorded ({{context_length}} characters).\nNow proceeding with final submission.\n</context_received>\n",
+        "action_regex": "```bash\\s*\\n(.*?)\\n```",
+        "context_regex": "<PATCH_CONTEXT>(.*?)</PATCH_CONTEXT>",
+        "step_limit": 300,
+        "cost_limit": 5.0,
+        "save_context_to_file": true
+      },
+      "model": {
+        "model_name": "mistral/devstral-2512",
+        "model_kwargs": {
+          "drop_params": true,
+          "temperature": 0.0
+        },
+        "litellm_model_registry": null,
+        "set_cache_control": null,
+        "cost_tracking": "ignore_errors"
+      },
+      "environment": {
+        "image": "ghcr.io/timesler/swe-polybench.eval.x86_64.huggingface__transformers-5122:latest",
+        "cwd": "/testbed",
+        "env": {
+          "PAGER": "cat",
+          "MANPAGER": "cat",
+          "LESS": "-R",
+          "PIP_PROGRESS_BAR": "off",
+          "TQDM_DISABLE": "1"
+        },
+        "forward_env": [],
+        "timeout": 60,
+        "executable": "docker",
+        "run_args": [
+          "--rm"
+        ],
+        "container_timeout": "2h",
+        "pull_timeout": 3600
+      },
+      "agent_type": "__main__.ProgressTrackingContextAwareAgent",
+      "model_type": "minisweagent.models.litellm_model.LitellmModel",
+      "environment_type": "minisweagent.environments.docker.DockerEnvironment"
+    },
+    "docker_config": {
+      "dockerfile_content": null,
+      "base_image": "ghcr.io/timesler/swe-polybench.eval.x86_64.huggingface__transformers-5122:latest",
+      "source": "prebuilt_polybench"
+    }
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.\nYour response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).\n\nInclude a THOUGHT section before your command where you explain your reasoning process.\nFormat your response as shown in <format_example>.\n\n<format_example>\nTHOUGHT: Your reasoning and analysis here\n\n```bash\nyour_command_here\n```\n</format_example>\n\nFailure to follow these rules will cause your response to be rejected.",
+      "timestamp": 1767256757.7013817
+    },
+    {
+      "role": "user",
+      "content": "<pr_description>\nConsider the following PR description:\ndata_collator.py does not allow NoneType labels for test set predictions on Glue\n# \ud83d\udc1b Bug\r\n\r\n## Information\r\n\r\nModel I am using (Bert, XLNet ...): Distilbert\r\n\r\nLanguage I am using the model on (English, Chinese ...): English\r\n\r\nThe problem arises when using:\r\n* [x] the official example scripts: (give details below) \r\n* [ ] my own modified scripts: (give details below)\r\n\r\nThe tasks I am working on is:\r\n* [x] an official GLUE/SQUaD task: (give the name)\r\n* [x] my own task or dataset: (give details below)\r\n\r\n\r\n## To reproduce\r\n\r\nSteps to reproduce the behavior:\r\n\r\n1. Open the  example Colab for text-classification from here https://huggingface.co/transformers/examples.html\r\n2. Try to run the prediction function found in run_glue.py to predict on the official Glue test set. \r\n3. The error is as shown below. \r\n\r\nEarlier, this has worked with the exact same program, ever since an update recently, this error shows up. \r\n\r\n`TypeError                                 Traceback (most recent call last)\r\n<ipython-input-16-9eecdd4d48b1> in <module>()\r\n      2 output_mode = \"classification\"\r\n      3 \r\n----> 4 predictions = trainer.predict(test_dataset=test_dataset).predictions\r\n      5 if output_mode == \"classification\":\r\n      6     predictions = np.argmax(predictions, axis=1)\r\n\r\n7 frames\r\n/usr/local/lib/python3.6/dist-packages/transformers/data/data_collator.py in default_data_collator(features)\r\n     45     if \"label\" in first:\r\n     46         dtype = torch.long if type(first[\"label\"]) is int else torch.float\r\n---> 47         batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\r\n     48     elif \"label_ids\" in first:\r\n     49         if isinstance(first[\"label_ids\"], torch.Tensor):\r\n\r\nTypeError: must be real number, not NoneType`\r\n\r\n<!-- If you have code snippets, error messages, stack traces please provide them here as well.\r\n     Important! Use code tags to correctly format your code. See https://help.github.com/en/github/writing-on-github/creating-and-highlighting-code-blocks#syntax-highlighting\r\n     Do not use screenshots, as they are hard to read and (more importantly) don't allow others to copy-and-paste your code.-->\r\n\r\n## Expected behavior\r\nThe error can be seen in the Colab notebook here https://colab.research.google.com/drive/1H_92qdsOOql2hS210qNrfMEEMRcAoHD_?usp=sharing\r\n\r\n<!-- A clear and concise description of what you would expect to happen. -->\r\n\r\n## Environment info\r\n<!-- You can run the command `transformers-cli env` and copy-and-paste its output below.\r\n     Don't forget to fill out the missing fields in that output! -->\r\n     \r\n- `transformers` version:\r\n- Platform: Colab\r\n- Python version: NA\r\n- PyTorch version (GPU?):\r\n- Tensorflow version (GPU?):\r\n- Using GPU in script?: Yes\r\n- Using distributed or parallel set-up in script?:\r\n\ndata_collator.py does not allow NoneType labels for test set predictions on Glue\n# \ud83d\udc1b Bug\r\n\r\n## Information\r\n\r\nModel I am using (Bert, XLNet ...): Distilbert\r\n\r\nLanguage I am using the model on (English, Chinese ...): English\r\n\r\nThe problem arises when using:\r\n* [x] the official example scripts: (give details below) \r\n* [ ] my own modified scripts: (give details below)\r\n\r\nThe tasks I am working on is:\r\n* [x] an official GLUE/SQUaD task: (give the name)\r\n* [x] my own task or dataset: (give details below)\r\n\r\n\r\n## To reproduce\r\n\r\nSteps to reproduce the behavior:\r\n\r\n1. Open the  example Colab for text-classification from here https://huggingface.co/transformers/examples.html\r\n2. Try to run the prediction function found in run_glue.py to predict on the official Glue test set. \r\n3. The error is as shown below. \r\n\r\nEarlier, this has worked with the exact same program, ever since an update recently, this error shows up. \r\n\r\n`TypeError                                 Traceback (most recent call last)\r\n<ipython-input-16-9eecdd4d48b1> in <module>()\r\n      2 output_mode = \"classification\"\r\n      3 \r\n----> 4 predictions = trainer.predict(test_dataset=test_dataset).predictions\r\n      5 if output_mode == \"classification\":\r\n      6     predictions = np.argmax(predictions, axis=1)\r\n\r\n7 frames\r\n/usr/local/lib/python3.6/dist-packages/transformers/data/data_collator.py in default_data_collator(features)\r\n     45     if \"label\" in first:\r\n     46         dtype = torch.long if type(first[\"label\"]) is int else torch.float\r\n---> 47         batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\r\n     48     elif \"label_ids\" in first:\r\n     49         if isinstance(first[\"label_ids\"], torch.Tensor):\r\n\r\nTypeError: must be real number, not NoneType`\r\n\r\n<!-- If you have code snippets, error messages, stack traces please provide them here as well.\r\n     Important! Use code tags to correctly format your code. See https://help.github.com/en/github/writing-on-github/creating-and-highlighting-code-blocks#syntax-highlighting\r\n     Do not use screenshots, as they are hard to read and (more importantly) don't allow others to copy-and-paste your code.-->\r\n\r\n## Expected behavior\r\nThe error can be seen in the Colab notebook here https://colab.research.google.com/drive/1H_92qdsOOql2hS210qNrfMEEMRcAoHD_?usp=sharing\r\n\r\n<!-- A clear and concise description of what you would expect to happen. -->\r\n\r\n## Environment info\r\n<!-- You can run the command `transformers-cli env` and copy-and-paste its output below.\r\n     Don't forget to fill out the missing fields in that output! -->\r\n     \r\n- `transformers` version:\r\n- Platform: Colab\r\n- Python version: NA\r\n- PyTorch version (GPU?):\r\n- Tensorflow version (GPU?):\r\n- Using GPU in script?: Yes\r\n- Using distributed or parallel set-up in script?:\r\n\n\n</pr_description>\n\n<instructions>\n# Task Instructions\n\n## Overview\nYou're a software engineer interacting continuously with a computer by submitting commands.\nYou'll be helping implement necessary changes to meet requirements in the PR description.\nYour task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.\n\nIMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.\n\nFor each response:\n1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish\n2. Provide exactly ONE bash command to execute\n\n## Important Boundaries\n- MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)\n- DO NOT MODIFY: Tests, project configuration files (e.g., build configs, lockfiles, CI configs), or environment setup unless the PR description explicitly requires it.\n\n## Recommended Workflow\n1. Analyze the codebase by finding and reading relevant files\n2. Create a script to reproduce the issue\n3. Edit the source code to resolve the issue\n4. Verify your fix works by running your script again\n5. Test edge cases to ensure your fix is robust\n\n## Command Execution Rules\nYou are operating in an environment where\n1. You write a single command\n2. The system executes that command in a subshell\n3. You see the result\n4. You write your next command\n\nEach response should include:\n1. A **THOUGHT** section where you explain your reasoning and plan\n2. A single bash code block with your command\n\nFormat your responses like this:\n\n<format_example>\nTHOUGHT: Here I explain my reasoning process, analysis of the current situation,\nand what I'm trying to accomplish with the command below.\n\n```bash\nyour_command_here\n```\n</format_example>\n\n**CRITICAL REQUIREMENTS:**\n- Your response SHOULD include a THOUGHT section explaining your reasoning\n- Your response MUST include EXACTLY ONE bash code block\n- This bash block MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)\n- If you include zero or multiple bash blocks, or no command at all, YOUR RESPONSE WILL FAIL\n- Do NOT try to run multiple independent commands in separate blocks in one response\n- Directory or environment variable changes are not persistent. Every action is executed in a new subshell.\n- However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files\n\n## Explore-context Marking (STRICT, REQUIRED FOR FILE READING)\nWhen you are exploring code context (reading files / printing line ranges), you MUST include a machine-parseable\nexplore-context block BEFORE your bash code block. This is independent of the command you use (cat/sed/nl/head/etc).\n\n**When NOT to include `<EXPLORE_CONTEXT>`:**\n- Do NOT include it for non-reading exploration like `ls -la`, `find`, `rg/grep` (search-only), `git status`, etc.\n- Only include it when your command will PRINT actual source code content (a file snippet / line range) to stdout\n  for you to read.\n\n**Explore-context block format (STRICT):**\n- MUST be enclosed in `<EXPLORE_CONTEXT> ... </EXPLORE_CONTEXT>` tags.\n- Inside, include ONE OR MORE entries, each entry exactly:\n  `File: /absolute/path/to/file.ext`\n  `Lines: <start>-<end>`\n- Multiple entries are separated by a blank line.\n- Use ABSOLUTE paths only.\n- `<start>` and `<end>` MUST be positive integers and `<start> <= <end>`.\n- Do NOT include any other text (no explanation, no code, no extra keys).\n\n**Command/output consistency (STRICT):**\nYour bash command MUST print the declared file line range(s) to stdout (the terminal output we see),\nso we can map `<EXPLORE_CONTEXT>` entries to the observed `<output>` content.\n\n**Good examples:**\n<EXPLORE_CONTEXT>\nFile: /testbed/src/foo.py\nLines: 10-40\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/foo.py | sed -n '10,40p'\n```\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/a.py\nLines: 1-80\n\nFile: /testbed/src/b.py\nLines: 120-160\n</EXPLORE_CONTEXT>\n\n```bash\n(nl -ba /testbed/src/a.py | sed -n '1,80p' && echo '---' && nl -ba /testbed/src/b.py | sed -n '120,160p')\n```\n\n## Environment Details\n- You have a full Linux shell environment\n- Always use non-interactive flags (-y, -f) for commands\n- Avoid interactive tools like vi, nano, or any that require user input\n- If a command isn't available, you can install it\n\n## Useful Command Examples\n\n### Create a new file:\n```bash\ncat <<'EOF' > newfile.txt\nhello world\nEOF\n```\n\n### Edit files with sed:\n```bash\n# Replace all occurrences\nsed -i 's/old_string/new_string/g' filename.py\n\n# Replace only first occurrence\nsed -i 's/old_string/new_string/' filename.py\n\n# Replace first occurrence on line 1\nsed -i '1s/old_string/new_string/' filename.py\n\n# Replace all occurrences in lines 1-10\nsed -i '1,10s/old_string/new_string/g' filename.py\n```\n\n### View file content:\n```bash\n# View specific lines with numbers\nnl -ba filename.py | sed -n '10,20p'\n```\n\n## Submission\nWhen you've completed your work (reading, editing, testing), and cannot make further progress\nissue exactly the following command:\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\nThis command will submit your work.\nYou cannot continue working (reading, editing, testing) in any way on this task after submitting.\n</instructions>",
+      "timestamp": 1767256757.7068665
+    },
+    {
+      "role": "assistant",
+      "content": "I'll start by analyzing the PR description to understand the issue and then explore the codebase to find the relevant files.\n\n## Understanding the Problem\n\nThe issue is that `data_collator.py` does not allow `NoneType` labels for test set predictions on GLUE tasks. When trying to run predictions on a test dataset (which doesn't have labels), the code fails with a `TypeError: must be real number, not NoneType` because it's trying to create a tensor from `None` values.\n\nThe error occurs in the `default_data_collator` function when it tries to create a tensor from labels that are `None` for test datasets.\n\nLet me start by exploring the codebase structure and finding the relevant files.",
+      "timestamp": 1767256761.6435738,
+      "extra": {
+        "response": {
+          "id": "b39cce58b7d648b1933796ae5939f4f4",
+          "created": 1767256757,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "message": {
+                "content": "I'll start by analyzing the PR description to understand the issue and then explore the codebase to find the relevant files.\n\n## Understanding the Problem\n\nThe issue is that `data_collator.py` does not allow `NoneType` labels for test set predictions on GLUE tasks. When trying to run predictions on a test dataset (which doesn't have labels), the code fails with a `TypeError: must be real number, not NoneType` because it's trying to create a tensor from `None` values.\n\nThe error occurs in the `default_data_collator` function when it tries to create a tensor from labels that are `None` for test datasets.\n\nLet me start by exploring the codebase structure and finding the relevant files.",
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "find /testbed -type f -name \"data_collator.py\" | head -20\n</code></blockquote>\n\n<format_example>\nTHOUGHT: I need to find the data_collator.py file mentioned in the error. Let me search for it in the testbed directory.\n</format_example>\n\n```bash\nfind /testbed -type f -name \"data_collator.py\" | head -20\n```",
+                      "name": "bash"
+                    },
+                    "id": "mDgE0tTjg",
+                    "type": "function"
+                  }
+                ],
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 250,
+            "prompt_tokens": 3172,
+            "total_tokens": 3422,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 0 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256761.651925
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I need to explore the codebase structure to understand the layout and find the relevant files mentioned in the error. Let me start by listing the directory structure and locating the data_collator.py file.\n\n```bash\nfind /testbed -type f -name \"data_collator.py\" 2>/dev/null\n```\n\n## Exploring the codebase structure\n\nLet me also check the overall structure of the testbed directory to understand the layout better.```bash\nls -la /testbed\n```",
+      "timestamp": 1767256763.8610895,
+      "extra": {
+        "response": {
+          "id": "86e085b5e71e47bdbf587d74cda36ee4",
+          "created": 1767256761,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I need to explore the codebase structure to understand the layout and find the relevant files mentioned in the error. Let me start by listing the directory structure and locating the data_collator.py file.\n\n```bash\nfind /testbed -type f -name \"data_collator.py\" 2>/dev/null\n```\n\n## Exploring the codebase structure\n\nLet me also check the overall structure of the testbed directory to understand the layout better.```bash\nls -la /testbed\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 110,
+            "prompt_tokens": 3423,
+            "total_tokens": 3533,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 2 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256763.8686476
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I need to find the data_collator.py file to understand the issue. Let me search for it in the testbed directory.\n\n```bash\nfind /testbed -type f -name \"data_collator.py\" 2>/dev/null\n```",
+      "timestamp": 1767256765.272318,
+      "extra": {
+        "response": {
+          "id": "342c98be985b4389abb1b37222396d08",
+          "created": 1767256764,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I need to find the data_collator.py file to understand the issue. Let me search for it in the testbed directory.\n\n```bash\nfind /testbed -type f -name \"data_collator.py\" 2>/dev/null\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 59,
+            "prompt_tokens": 3631,
+            "total_tokens": 3690,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n/testbed/src/transformers/data/data_collator.py\n</output>",
+      "timestamp": 1767256765.3856812
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Great! I found the data_collator.py file. Now let me examine its contents to understand the issue better, particularly around the error mentioned in the PR description.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-60\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '1,60p'\n```",
+      "timestamp": 1767256767.0436945,
+      "extra": {
+        "response": {
+          "id": "6a34da7f65194bf1ae987429ddf3fb9f",
+          "created": 1767256765,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Great! I found the data_collator.py file. Now let me examine its contents to understand the issue better, particularly around the error mentioned in the PR description.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-60\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '1,60p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 111,
+            "prompt_tokens": 3722,
+            "total_tokens": 3833,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-60</explore_context>\n<returncode>0</returncode>\n<output>\n     1\tfrom dataclasses import dataclass\n     2\tfrom typing import Any, Callable, Dict, List, NewType, Tuple\n     3\t\n     4\timport torch\n     5\tfrom torch.nn.utils.rnn import pad_sequence\n     6\t\n     7\tfrom ..tokenization_utils import PreTrainedTokenizer\n     8\t\n     9\t\n    10\tInputDataClass = NewType(\"InputDataClass\", Any)\n    11\t\n    12\t\"\"\"\n    13\tA DataCollator is a function that takes a list of samples from a Dataset\n    14\tand collate them into a batch, as a dictionary of Tensors.\n    15\t\"\"\"\n    16\tDataCollator = NewType(\"DataCollator\", Callable[[List[InputDataClass]], Dict[str, torch.Tensor]])\n    17\t\n    18\t\n    19\tdef default_data_collator(features: List[InputDataClass]) -> Dict[str, torch.Tensor]:\n    20\t    \"\"\"\n    21\t    Very simple data collator that:\n    22\t    - simply collates batches of dict-like objects\n    23\t    - Performs special handling for potential keys named:\n    24\t        - `label`: handles a single value (int or float) per object\n    25\t        - `label_ids`: handles a list of values per object\n    26\t    - does not do any additional preprocessing\n    27\t\n    28\t    i.e., Property names of the input object will be used as corresponding inputs to the model.\n    29\t    See glue and ner for example of how it's useful.\n    30\t    \"\"\"\n    31\t\n    32\t    # In this function we'll make the assumption that all `features` in the batch\n    33\t    # have the same attributes.\n    34\t    # So we will look at the first element as a proxy for what attributes exist\n    35\t    # on the whole batch.\n    36\t    if not isinstance(features[0], dict):\n    37\t        features = [vars(f) for f in features]\n    38\t\n    39\t    first = features[0]\n    40\t    batch = {}\n    41\t\n    42\t    # Special handling for labels.\n    43\t    # Ensure that tensor is created with the correct type\n    44\t    # (it should be automatically the case, but let's make sure of it.)\n    45\t    if \"label\" in first:\n    46\t        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n    47\t        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n    48\t    elif \"label_ids\" in first:\n    49\t        if isinstance(first[\"label_ids\"], torch.Tensor):\n    50\t            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n    51\t        else:\n    52\t            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n    53\t            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n    54\t\n    55\t    # Handling of all other possible keys.\n    56\t    # Again, we will use the first element to figure out which key/values are not None for this model.\n    57\t    for k, v in first.items():\n    58\t        if k not in (\"label\", \"label_ids\") and v is not None and not isinstance(v, str):\n    59\t            if isinstance(v, torch.Tensor):\n    60\t                batch[k] = torch.stack([f[k] for f in features])\n</output>",
+      "timestamp": 1767256767.1572714
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I can see the issue! In lines 45-47, the code checks if \"label\" is in the first feature and tries to create a tensor from all labels. However, when working with test datasets, the labels are `None`, which causes the `TypeError: must be real number, not NoneType` when trying to create a tensor.\n\nLet me see the rest of the file to understand the complete context.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 60-120\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '60,120p'\n```",
+      "timestamp": 1767256769.5490718,
+      "extra": {
+        "response": {
+          "id": "118aef5d98d2431abfe75968b15e791f",
+          "created": 1767256767,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I can see the issue! In lines 45-47, the code checks if \"label\" is in the first feature and tries to create a tensor from all labels. However, when working with test datasets, the labels are `None`, which causes the `TypeError: must be real number, not NoneType` when trying to create a tensor.\n\nLet me see the rest of the file to understand the complete context.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 60-120\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '60,120p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 169,
+            "prompt_tokens": 4750,
+            "total_tokens": 4919,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 60-120</explore_context>\n<returncode>0</returncode>\n<output>\n    60\t                batch[k] = torch.stack([f[k] for f in features])\n    61\t            else:\n    62\t                batch[k] = torch.tensor([f[k] for f in features], dtype=torch.long)\n    63\t\n    64\t    return batch\n    65\t\n    66\t\n    67\t@dataclass\n    68\tclass DataCollatorForLanguageModeling:\n    69\t    \"\"\"\n    70\t    Data collator used for language modeling.\n    71\t    - collates batches of tensors, honoring their tokenizer's pad_token\n    72\t    - preprocesses batches for masked language modeling\n    73\t    \"\"\"\n    74\t\n    75\t    tokenizer: PreTrainedTokenizer\n    76\t    mlm: bool = True\n    77\t    mlm_probability: float = 0.15\n    78\t\n    79\t    def __call__(self, examples: List[torch.Tensor]) -> Dict[str, torch.Tensor]:\n    80\t        batch = self._tensorize_batch(examples)\n    81\t        if self.mlm:\n    82\t            inputs, labels = self.mask_tokens(batch)\n    83\t            return {\"input_ids\": inputs, \"labels\": labels}\n    84\t        else:\n    85\t            return {\"input_ids\": batch, \"labels\": batch}\n    86\t\n    87\t    def _tensorize_batch(self, examples: List[torch.Tensor]) -> torch.Tensor:\n    88\t        length_of_first = examples[0].size(0)\n    89\t        are_tensors_same_length = all(x.size(0) == length_of_first for x in examples)\n    90\t        if are_tensors_same_length:\n    91\t            return torch.stack(examples, dim=0)\n    92\t        else:\n    93\t            if self.tokenizer._pad_token is None:\n    94\t                raise ValueError(\n    95\t                    \"You are attempting to pad samples but the tokenizer you are using\"\n    96\t                    f\" ({self.tokenizer.__class__.__name__}) does not have one.\"\n    97\t                )\n    98\t            return pad_sequence(examples, batch_first=True, padding_value=self.tokenizer.pad_token_id)\n    99\t\n   100\t    def mask_tokens(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:\n   101\t        \"\"\"\n   102\t        Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.\n   103\t        \"\"\"\n   104\t\n   105\t        if self.tokenizer.mask_token is None:\n   106\t            raise ValueError(\n   107\t                \"This tokenizer does not have a mask token which is necessary for masked language modeling. Remove the --mlm flag if you want to use this tokenizer.\"\n   108\t            )\n   109\t\n   110\t        labels = inputs.clone()\n   111\t        # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)\n   112\t        probability_matrix = torch.full(labels.shape, self.mlm_probability)\n   113\t        special_tokens_mask = [\n   114\t            self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()\n   115\t        ]\n   116\t        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)\n   117\t        if self.tokenizer._pad_token is not None:\n   118\t            padding_mask = labels.eq(self.tokenizer.pad_token_id)\n   119\t            probability_matrix.masked_fill_(padding_mask, value=0.0)\n   120\t        masked_indices = torch.bernoulli(probability_matrix).bool()\n</output>",
+      "timestamp": 1767256769.622421
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Now I understand the issue completely. The problem is in the `default_data_collator` function at lines 45-47. When a test dataset is used, the \"label\" field exists but is `None` for all samples. The current code doesn't handle this case and tries to create a tensor from `None` values, which fails.\n\nThe fix should check if the label is `None` and handle it appropriately. Let me also check if there are any tests related to this to understand the expected behavior better.\n\n```bash\nfind /testbed -type f -name \"*.py\" -path \"*/test*\" | xargs grep -l \"data_collator\\|default_data_collator\" 2>/dev/null | head -5\n```",
+      "timestamp": 1767256772.5968118,
+      "extra": {
+        "response": {
+          "id": "e4cd19773a1947f7aca493141081b5a3",
+          "created": 1767256769,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Now I understand the issue completely. The problem is in the `default_data_collator` function at lines 45-47. When a test dataset is used, the \"label\" field exists but is `None` for all samples. The current code doesn't handle this case and tries to create a tensor from `None` values, which fails.\n\nThe fix should check if the label is `None` and handle it appropriately. Let me also check if there are any tests related to this to understand the expected behavior better.\n\n```bash\nfind /testbed -type f -name \"*.py\" -path \"*/test*\" | xargs grep -l \"data_collator\\|default_data_collator\" 2>/dev/null | head -5\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 166,
+            "prompt_tokens": 5908,
+            "total_tokens": 6074,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n/testbed/src/transformers/data/data_collator.py\n/testbed/src/transformers/trainer.py\n/testbed/src/transformers/__init__.py\n/testbed/tests/test_trainer.py\n/testbed/tests/test_trainer_distributed.py\n</output>",
+      "timestamp": 1767256772.8143103
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me check the test files to understand how the data collator is expected to work with None labels.\n\n```bash\ngrep -n -A 10 -B 5 \"None.*label\\|label.*None\" /testbed/tests/test_trainer.py | head -30\n```",
+      "timestamp": 1767256774.7150636,
+      "extra": {
+        "response": {
+          "id": "897a59ea5db54e6aa611caa05ea6a6a7",
+          "created": 1767256772,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me check the test files to understand how the data collator is expected to work with None labels.\n\n```bash\ngrep -n -A 10 -B 5 \"None.*label\\|label.*None\" /testbed/tests/test_trainer.py | head -30\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 66,
+            "prompt_tokens": 6145,
+            "total_tokens": 6211,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n</output>",
+      "timestamp": 1767256774.826761
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me check the trainer.py file to see how the data collator is used, which might give me more context about the expected behavior.\n\n```bash\ngrep -n -A 5 -B 5 \"data_collator\" /testbed/src/transformers/trainer.py | head -30\n```",
+      "timestamp": 1767256776.4324443,
+      "extra": {
+        "response": {
+          "id": "1f2ba916b2724376b2d5b95df77fa9a8",
+          "created": 1767256774,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me check the trainer.py file to see how the data collator is used, which might give me more context about the expected behavior.\n\n```bash\ngrep -n -A 5 -B 5 \"data_collator\" /testbed/src/transformers/trainer.py | head -30\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 71,
+            "prompt_tokens": 6229,
+            "total_tokens": 6300,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n17-from torch.utils.data.dataset import Dataset\n18-from torch.utils.data.distributed import DistributedSampler\n19-from torch.utils.data.sampler import RandomSampler, Sampler, SequentialSampler\n20-from tqdm.auto import tqdm, trange\n21-\n22:from .data.data_collator import DataCollator, default_data_collator\n23-from .modeling_utils import PreTrainedModel\n24-from .optimization import AdamW, get_linear_schedule_with_warmup\n25-from .trainer_utils import PREFIX_CHECKPOINT_DIR, EvalPrediction, PredictionOutput, TrainOutput, is_wandb_available\n26-from .training_args import TrainingArguments, is_torch_tpu_available\n27-\n--\n143-    optimized for Transformers.\n144-    \"\"\"\n145-\n146-    model: PreTrainedModel\n147-    args: TrainingArguments\n148:    data_collator: DataCollator\n149-    train_dataset: Optional[Dataset]\n150-    eval_dataset: Optional[Dataset]\n151-    compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None\n152-    prediction_loss_only: bool\n153-    tb_writer: Optional[\"SummaryWriter\"] = None\n--\n157-\n158-    def __init__(\n159-        self,\n160-        model: PreTrainedModel,\n161-        args: TrainingArguments,\n162:        data_collator: Optional[DataCollator] = None,\n</output>",
+      "timestamp": 1767256776.548198
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Now let me create a simple test script to reproduce the issue and understand the expected behavior.\n\n```bash\ncat <<'EOF' > /testbed/test_reproduce_issue.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Test case 1: Normal case with labels\nfeatures_with_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": 0},\n]\n\n# Test case 2: Test set case with None labels (this should fail with current code)\nfeatures_with_none_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Test case 3: Features without label key\nfeatures_without_labels = [\n    {\"input_ids\": [1, 2, 3]},\n    {\"input_ids\": [4, 5, 6]},\n]\n\nprint(\"Testing case 1: Features with labels\")\ntry:\n    result = default_data_collator(features_with_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 2: Features with None labels (test set)\")\ntry:\n    result = default_data_collator(features_with_none_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 3: Features without label key\")\ntry:\n    result = default_data_collator(features_without_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+      "timestamp": 1767256781.8624458,
+      "extra": {
+        "response": {
+          "id": "6f3e3a177bb44cbfa4e4dc28313119fb",
+          "created": 1767256776,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Now let me create a simple test script to reproduce the issue and understand the expected behavior.\n\n```bash\ncat <<'EOF' > /testbed/test_reproduce_issue.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Test case 1: Normal case with labels\nfeatures_with_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": 0},\n]\n\n# Test case 2: Test set case with None labels (this should fail with current code)\nfeatures_with_none_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Test case 3: Features without label key\nfeatures_without_labels = [\n    {\"input_ids\": [1, 2, 3]},\n    {\"input_ids\": [4, 5, 6]},\n]\n\nprint(\"Testing case 1: Features with labels\")\ntry:\n    result = default_data_collator(features_with_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 2: Features with None labels (test set)\")\ntry:\n    result = default_data_collator(features_with_none_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 3: Features without label key\")\ntry:\n    result = default_data_collator(features_without_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 415,
+            "prompt_tokens": 6674,
+            "total_tokens": 7089,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 2 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256781.8718975
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me create and run the test script to reproduce the issue.\n\n```bash\ncat <<'EOF' > /testbed/test_reproduce_issue.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Test case 1: Normal case with labels\nfeatures_with_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": 0},\n]\n\n# Test case 2: Test set case with None labels (this should fail with current code)\nfeatures_with_none_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Test case 3: Features without label key\nfeatures_without_labels = [\n    {\"input_ids\": [1, 2, 3]},\n    {\"input_ids\": [4, 5, 6]},\n]\n\nprint(\"Testing case 1: Features with labels\")\ntry:\n    result = default_data_collator(features_with_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 2: Features with None labels (test set)\")\ntry:\n    result = default_data_collator(features_with_none_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 3: Features without label key\")\ntry:\n    result = default_data_collator(features_without_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n```",
+      "timestamp": 1767256784.102476,
+      "extra": {
+        "response": {
+          "id": "8b848bc0329e4392be113a7caca2ca44",
+          "created": 1767256782,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me create and run the test script to reproduce the issue.\n\n```bash\ncat <<'EOF' > /testbed/test_reproduce_issue.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Test case 1: Normal case with labels\nfeatures_with_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": 0},\n]\n\n# Test case 2: Test set case with None labels (this should fail with current code)\nfeatures_with_none_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Test case 3: Features without label key\nfeatures_without_labels = [\n    {\"input_ids\": [1, 2, 3]},\n    {\"input_ids\": [4, 5, 6]},\n]\n\nprint(\"Testing case 1: Features with labels\")\ntry:\n    result = default_data_collator(features_with_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 2: Features with None labels (test set)\")\ntry:\n    result = default_data_collator(features_with_none_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting case 3: Features without label key\")\ntry:\n    result = default_data_collator(features_without_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 392,
+            "prompt_tokens": 7188,
+            "total_tokens": 7580,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n</output>",
+      "timestamp": 1767256784.2235506
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Now let me run the test script to reproduce the issue.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+      "timestamp": 1767256786.3211188,
+      "extra": {
+        "response": {
+          "id": "325abbf396ee48ab80d5788d15c1a841",
+          "created": 1767256784,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Now let me run the test script to reproduce the issue.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 36,
+            "prompt_tokens": 7598,
+            "total_tokens": 7634,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:39:49.123778: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:39:49.180240: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:39:50.320265: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting case 1: Features with labels\nSUCCESS - Result: {'labels': tensor([1, 0]), 'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting case 2: Features with None labels (test set)\nFAILED - Error: must be real number, not NoneType\n\nTesting case 3: Features without label key\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n</output>",
+      "timestamp": 1767256796.789604
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Perfect! I've successfully reproduced the issue. The test case 2 fails with \"must be real number, not NoneType\" error, which matches the PR description. Now I need to fix the `default_data_collator` function to handle `None` labels properly.\n\nThe fix should:\n1. Check if the label is `None` \n2. If all labels are `None`, we should either skip adding the \"labels\" key to the batch or add it as `None`\n3. If some labels are `None` and some are not, we need to handle that case appropriately\n\nLet me examine the current code more carefully and implement the fix.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-54\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,54p'\n```",
+      "timestamp": 1767256800.195522,
+      "extra": {
+        "response": {
+          "id": "fd43de4bd90b4f83bb042fd26638fddc",
+          "created": 1767256796,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Perfect! I've successfully reproduced the issue. The test case 2 fails with \"must be real number, not NoneType\" error, which matches the PR description. Now I need to fix the `default_data_collator` function to handle `None` labels properly.\n\nThe fix should:\n1. Check if the label is `None` \n2. If all labels are `None`, we should either skip adding the \"labels\" key to the batch or add it as `None`\n3. If some labels are `None` and some are not, we need to handle that case appropriately\n\nLet me examine the current code more carefully and implement the fix.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-54\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,54p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 215,
+            "prompt_tokens": 7970,
+            "total_tokens": 8185,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-54</explore_context>\n<returncode>0</returncode>\n<output>\n    42\t    # Special handling for labels.\n    43\t    # Ensure that tensor is created with the correct type\n    44\t    # (it should be automatically the case, but let's make sure of it.)\n    45\t    if \"label\" in first:\n    46\t        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n    47\t        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n    48\t    elif \"label_ids\" in first:\n    49\t        if isinstance(first[\"label_ids\"], torch.Tensor):\n    50\t            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n    51\t        else:\n    52\t            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n    53\t            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n    54\t\n</output>",
+      "timestamp": 1767256800.3161287
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Now I'll implement the fix. The solution is to check if the first label is `None` and if so, check if all labels are `None`. If they are all `None`, we should not add the \"labels\" key to the batch (similar to when the key doesn't exist at all).\n\n```bash\ncat <<'EOF' > /tmp/fix_data_collator.py\nimport sys\nsys.path.insert(0, '/testbed/src')\n\n# Read the current file\nwith open('/testbed/src/transformers/data/data_collator.py', 'r') as f:\n    content = f.read()\n\n# Find and replace the problematic section\nold_code = '''    # Special handling for labels.\n    # Ensure that tensor is created with the correct type\n    # (it should be automatically the case, but let's make sure of it.)\n    if \"label\" in first:\n        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)'''\n\nnew_code = '''    # Special handling for labels.\n    # Ensure that tensor is created with the correct type\n    # (it should be automatically the case, but let's make sure of it.)\n    if \"label\" in first:\n        # Check if all labels are None (e.g., for test set prediction)\n        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n            # Don't add labels to batch if all are None\n            pass\n        else:\n            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)'''\n\n# Replace the code\nnew_content = content.replace(old_code, new_code)\n\n# Write back\nwith open('/testbed/src/transformers/data/data_collator.py', 'w') as f:\n    f.write(new_content)\n\nprint(\"Fix applied successfully!\")\nEOF\n\npython /tmp/fix_data_collator.py\n```",
+      "timestamp": 1767256806.1158993,
+      "extra": {
+        "response": {
+          "id": "60147cd7f6f4427dbe3b3e3677495634",
+          "created": 1767256800,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Now I'll implement the fix. The solution is to check if the first label is `None` and if so, check if all labels are `None`. If they are all `None`, we should not add the \"labels\" key to the batch (similar to when the key doesn't exist at all).\n\n```bash\ncat <<'EOF' > /tmp/fix_data_collator.py\nimport sys\nsys.path.insert(0, '/testbed/src')\n\n# Read the current file\nwith open('/testbed/src/transformers/data/data_collator.py', 'r') as f:\n    content = f.read()\n\n# Find and replace the problematic section\nold_code = '''    # Special handling for labels.\n    # Ensure that tensor is created with the correct type\n    # (it should be automatically the case, but let's make sure of it.)\n    if \"label\" in first:\n        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)'''\n\nnew_code = '''    # Special handling for labels.\n    # Ensure that tensor is created with the correct type\n    # (it should be automatically the case, but let's make sure of it.)\n    if \"label\" in first:\n        # Check if all labels are None (e.g., for test set prediction)\n        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n            # Don't add labels to batch if all are None\n            pass\n        else:\n            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)'''\n\n# Replace the code\nnew_content = content.replace(old_code, new_code)\n\n# Write back\nwith open('/testbed/src/transformers/data/data_collator.py', 'w') as f:\n    f.write(new_content)\n\nprint(\"Fix applied successfully!\")\nEOF\n\npython /tmp/fix_data_collator.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 452,
+            "prompt_tokens": 8462,
+            "total_tokens": 8914,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\nFix applied successfully!\n</output>",
+      "timestamp": 1767256806.2713308
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Great! Now let me verify the fix by running the test script again to see if the issue is resolved.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+      "timestamp": 1767256807.7287138,
+      "extra": {
+        "response": {
+          "id": "296564a2eb044dc7ba308228d9edfc39",
+          "created": 1767256806,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Great! Now let me verify the fix by running the test script again to see if the issue is resolved.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 46,
+            "prompt_tokens": 8936,
+            "total_tokens": 8982,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:40:09.583761: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:09.632532: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:10.504122: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting case 1: Features with labels\nSUCCESS - Result: {'labels': tensor([1, 0]), 'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting case 2: Features with None labels (test set)\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting case 3: Features without label key\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n</output>",
+      "timestamp": 1767256812.721976
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Excellent! The fix works. Now test case 2 (features with None labels) passes successfully. The result shows that when all labels are None, the \"labels\" key is not added to the batch, which is the correct behavior.\n\nLet me also test some edge cases to make sure the fix is robust.\n\n```bash\ncat <<'EOF' > /testbed/test_edge_cases.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Edge case 1: Mixed None and non-None labels (should probably fail or handle gracefully)\nfeatures_mixed_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Edge case 2: label_ids with None values\nfeatures_none_label_ids = [\n    {\"input_ids\": [1, 2, 3], \"label_ids\": None},\n    {\"input_ids\": [4, 5, 6], \"label_ids\": None},\n]\n\n# Edge case 3: Empty features list (edge case)\nfeatures_empty = []\n\nprint(\"Testing edge case 1: Mixed None and non-None labels\")\ntry:\n    result = default_data_collator(features_mixed_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting edge case 2: None label_ids\")\ntry:\n    result = default_data_collator(features_none_label_ids)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting edge case 3: Empty features list\")\ntry:\n    result = default_data_collator(features_empty)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n\ncd /testbed && python test_edge_cases.py\n```",
+      "timestamp": 1767256817.570012,
+      "extra": {
+        "response": {
+          "id": "bbd43256afd24fbb889731cb5b293d62",
+          "created": 1767256812,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Excellent! The fix works. Now test case 2 (features with None labels) passes successfully. The result shows that when all labels are None, the \"labels\" key is not added to the batch, which is the correct behavior.\n\nLet me also test some edge cases to make sure the fix is robust.\n\n```bash\ncat <<'EOF' > /testbed/test_edge_cases.py\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Edge case 1: Mixed None and non-None labels (should probably fail or handle gracefully)\nfeatures_mixed_labels = [\n    {\"input_ids\": [1, 2, 3], \"label\": 1},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\n# Edge case 2: label_ids with None values\nfeatures_none_label_ids = [\n    {\"input_ids\": [1, 2, 3], \"label_ids\": None},\n    {\"input_ids\": [4, 5, 6], \"label_ids\": None},\n]\n\n# Edge case 3: Empty features list (edge case)\nfeatures_empty = []\n\nprint(\"Testing edge case 1: Mixed None and non-None labels\")\ntry:\n    result = default_data_collator(features_mixed_labels)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting edge case 2: None label_ids\")\ntry:\n    result = default_data_collator(features_none_label_ids)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n\nprint(\"\\nTesting edge case 3: Empty features list\")\ntry:\n    result = default_data_collator(features_empty)\n    print(\"SUCCESS - Result:\", result)\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nEOF\n\ncd /testbed && python test_edge_cases.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 427,
+            "prompt_tokens": 9335,
+            "total_tokens": 9762,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:40:19.413090: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:19.462095: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:20.320227: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting edge case 1: Mixed None and non-None labels\nFAILED - Error: an integer is required (got type NoneType)\n\nTesting edge case 2: None label_ids\nFAILED - Error: 'NoneType' object is not subscriptable\n\nTesting edge case 3: Empty features list\nFAILED - Error: list index out of range\n</output>",
+      "timestamp": 1767256822.5551414
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I see some edge cases that need to be handled. Let me check if these edge cases are realistic scenarios that need to be fixed, or if they're unlikely to occur in practice.\n\nFor edge case 1 (mixed None and non-None labels), this seems like an invalid scenario that shouldn't happen in practice - either you have labels or you don't.\n\nFor edge case 2 (None label_ids), this is similar to the label case and should be handled.\n\nFor edge case 3 (empty features), this is likely an invalid input.\n\nLet me check if the label_ids case needs to be handled similarly to the label case.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-60\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,60p'\n```",
+      "timestamp": 1767256826.2948923,
+      "extra": {
+        "response": {
+          "id": "86d698f003664a5d89a5af9d54f79021",
+          "created": 1767256822,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I see some edge cases that need to be handled. Let me check if these edge cases are realistic scenarios that need to be fixed, or if they're unlikely to occur in practice.\n\nFor edge case 1 (mixed None and non-None labels), this seems like an invalid scenario that shouldn't happen in practice - either you have labels or you don't.\n\nFor edge case 2 (None label_ids), this is similar to the label case and should be handled.\n\nFor edge case 3 (empty features), this is likely an invalid input.\n\nLet me check if the label_ids case needs to be handled similarly to the label case.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-60\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,60p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 209,
+            "prompt_tokens": 10056,
+            "total_tokens": 10265,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-60</explore_context>\n<returncode>0</returncode>\n<output>\n    42\t    # Special handling for labels.\n    43\t    # Ensure that tensor is created with the correct type\n    44\t    # (it should be automatically the case, but let's make sure of it.)\n    45\t    if \"label\" in first:\n    46\t        # Check if all labels are None (e.g., for test set prediction)\n    47\t        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n    48\t            # Don't add labels to batch if all are None\n    49\t            pass\n    50\t        else:\n    51\t            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n    52\t            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n    53\t    elif \"label_ids\" in first:\n    54\t        if isinstance(first[\"label_ids\"], torch.Tensor):\n    55\t            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n    56\t        else:\n    57\t            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n    58\t            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n    59\t\n    60\t    # Handling of all other possible keys.\n</output>",
+      "timestamp": 1767256826.3960943
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I should also handle the label_ids case to be consistent. Let me update the fix to handle both \"label\" and \"label_ids\" cases.\n\n```bash\ncat <<'EOF' > /tmp/fix_data_collator_v2.py\nimport sys\nsys.path.insert(0, '/testbed/src')\n\n# Read the current file\nwith open('/testbed/src/transformers/data/data_collator.py', 'r') as f:\n    content = f.read()\n\n# Find and replace the label_ids section as well\nold_code = '''    elif \"label_ids\" in first:\n        if isinstance(first[\"label_ids\"], torch.Tensor):\n            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n        else:\n            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)'''\n\nnew_code = '''    elif \"label_ids\" in first:\n        # Check if all label_ids are None (e.g., for test set prediction)\n        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n            # Don't add labels to batch if all are None\n            pass\n        else:\n            if isinstance(first[\"label_ids\"], torch.Tensor):\n                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n            else:\n                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)'''\n\n# Replace the code\nnew_content = content.replace(old_code, new_code)\n\n# Write back\nwith open('/testbed/src/transformers/data/data_collator.py', 'w') as f:\n    f.write(new_content)\n\nprint(\"Fix updated successfully!\")\nEOF\n\npython /tmp/fix_data_collator_v2.py\n```",
+      "timestamp": 1767256830.3039892,
+      "extra": {
+        "response": {
+          "id": "ff939bd4cd91468783a2d6729ef61048",
+          "created": 1767256826,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I should also handle the label_ids case to be consistent. Let me update the fix to handle both \"label\" and \"label_ids\" cases.\n\n```bash\ncat <<'EOF' > /tmp/fix_data_collator_v2.py\nimport sys\nsys.path.insert(0, '/testbed/src')\n\n# Read the current file\nwith open('/testbed/src/transformers/data/data_collator.py', 'r') as f:\n    content = f.read()\n\n# Find and replace the label_ids section as well\nold_code = '''    elif \"label_ids\" in first:\n        if isinstance(first[\"label_ids\"], torch.Tensor):\n            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n        else:\n            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)'''\n\nnew_code = '''    elif \"label_ids\" in first:\n        # Check if all label_ids are None (e.g., for test set prediction)\n        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n            # Don't add labels to batch if all are None\n            pass\n        else:\n            if isinstance(first[\"label_ids\"], torch.Tensor):\n                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n            else:\n                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)'''\n\n# Replace the code\nnew_content = content.replace(old_code, new_code)\n\n# Write back\nwith open('/testbed/src/transformers/data/data_collator.py', 'w') as f:\n    f.write(new_content)\n\nprint(\"Fix updated successfully!\")\nEOF\n\npython /tmp/fix_data_collator_v2.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 433,
+            "prompt_tokens": 10633,
+            "total_tokens": 11066,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\nFix updated successfully!\n</output>",
+      "timestamp": 1767256830.4204588
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Now let me test the updated fix with the edge cases again.\n\n```bash\ncd /testbed && python test_edge_cases.py\n```",
+      "timestamp": 1767256831.491968,
+      "extra": {
+        "response": {
+          "id": "4f25442099b54e6b9b0a29b15d80420c",
+          "created": 1767256830,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Now let me test the updated fix with the edge cases again.\n\n```bash\ncd /testbed && python test_edge_cases.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 35,
+            "prompt_tokens": 11088,
+            "total_tokens": 11123,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:40:33.333426: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:33.384292: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:34.265461: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting edge case 1: Mixed None and non-None labels\nFAILED - Error: an integer is required (got type NoneType)\n\nTesting edge case 2: None label_ids\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting edge case 3: Empty features list\nFAILED - Error: list index out of range\n</output>",
+      "timestamp": 1767256836.5594127
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Good! The label_ids case is now handled correctly. The mixed case (edge case 1) and empty list case (edge case 3) still fail, but these are likely invalid scenarios that shouldn't occur in practice. Let me verify that the main use case works correctly.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+      "timestamp": 1767256839.2173061,
+      "extra": {
+        "response": {
+          "id": "850b876788ba4a888c90d8d9b46805c8",
+          "created": 1767256836,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Good! The label_ids case is now handled correctly. The mixed case (edge case 1) and empty list case (edge case 3) still fail, but these are likely invalid scenarios that shouldn't occur in practice. Let me verify that the main use case works correctly.\n\n```bash\ncd /testbed && python test_reproduce_issue.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 81,
+            "prompt_tokens": 11432,
+            "total_tokens": 11513,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:40:41.096716: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:41.145484: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:41.986141: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting case 1: Features with labels\nSUCCESS - Result: {'labels': tensor([1, 0]), 'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting case 2: Features with None labels (test set)\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n\nTesting case 3: Features without label key\nSUCCESS - Result: {'input_ids': tensor([[1, 2, 3],\n        [4, 5, 6]])}\n</output>",
+      "timestamp": 1767256844.1734667
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Perfect! The main issue is fixed. Now let me run the existing tests to make sure I haven't broken anything.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py -xvs -k \"data_collator\" 2>&1 | head -50\n```",
+      "timestamp": 1767256846.4484398,
+      "extra": {
+        "response": {
+          "id": "a7367b68e8344acfbb13b6da8f65dc96",
+          "created": 1767256844,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Perfect! The main issue is fixed. Now let me run the existing tests to make sure I haven't broken anything.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py -xvs -k \"data_collator\" 2>&1 | head -50\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 69,
+            "prompt_tokens": 11866,
+            "total_tokens": 11935,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n============================= test session starts ==============================\nplatform linux -- Python 3.8.20, pytest-8.3.5, pluggy-1.5.0 -- /usr/local/bin/python\ncachedir: .pytest_cache\nrootdir: /testbed\nplugins: xdist-3.6.1\ncollecting ... 2026-01-01 08:40:48.781792: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:48.830526: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:49.989092: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\ncollected 7 items / 7 deselected / 0 selected\n\n============================ 7 deselected in 5.18s =============================\n</output>",
+      "timestamp": 1767256852.7913828
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me run a broader test to see if there are any tests that use the data collator functionality.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py -xvs 2>&1 | head -100\n```",
+      "timestamp": 1767256854.8709939,
+      "extra": {
+        "response": {
+          "id": "1b0627e68fcd4a21a3e994d3c0a6c758",
+          "created": 1767256852,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me run a broader test to see if there are any tests that use the data collator functionality.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py -xvs 2>&1 | head -100\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 59,
+            "prompt_tokens": 12260,
+            "total_tokens": 12319,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n============================= test session starts ==============================\nplatform linux -- Python 3.8.20, pytest-8.3.5, pluggy-1.5.0 -- /usr/local/bin/python\ncachedir: .pytest_cache\nrootdir: /testbed\nplugins: xdist-3.6.1\ncollecting ... 2026-01-01 08:40:56.925518: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:40:56.978589: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:40:57.850379: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\ncollected 7 items\n\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_classification \nDownloading:   0%|          | 0.00/213k [00:00<?, ?B/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 213k/213k [00:00<00:00, 2.28MB/s]PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_regression \n\nDownloading:   0%|          | 0.00/480 [00:00<?, ?B/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 480/480 [00:00<00:00, 1.13MB/s]\n\nDownloading:   0%|          | 0.00/899k [00:00<?, ?B/s]\nDownloading:  27%|\u2588\u2588\u258b       | 244k/899k [00:00<00:00, 2.42MB/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 899k/899k [00:00<00:00, 4.55MB/s]\n\nDownloading:   0%|          | 0.00/456k [00:00<?, ?B/s]\nDownloading:  60%|\u2588\u2588\u2588\u2588\u2588\u2588    | 275k/456k [00:00<00:00, 2.75MB/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 456k/456k [00:00<00:00, 3.57MB/s]PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_with_dict PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_lm_tokenizer_with_padding PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_lm_tokenizer_without_padding \n\nDownloading:   0%|          | 0.00/665 [00:00<?, ?B/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 665/665 [00:00<00:00, 1.45MB/s]\n\nDownloading:   0%|          | 0.00/1.04M [00:00<?, ?B/s]\nDownloading:  17%|\u2588\u258b        | 174k/1.04M [00:00<00:00, 1.71MB/s]\nDownloading:  72%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258f  | 749k/1.04M [00:00<00:00, 4.05MB/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 1.04M/1.04M [00:00<00:00, 4.81MB/s]\n\nDownloading:   0%|          | 0.00/456k [00:00<?, ?B/s]\nDownloading:  53%|\u2588\u2588\u2588\u2588\u2588\u258e    | 244k/456k [00:00<00:00, 2.43MB/s]\nDownloading: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 456k/456k [00:00<00:00, 3.45MB/s]PASSED\ntests/test_trainer.py::TrainerIntegrationTest::test_trainer_eval_lm PASSED\ntests/test_trainer.py::TrainerIntegrationTest::test_trainer_eval_mrpc PASSED\n\n=============================== warnings summary ===============================\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_classification\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_regression\ntests/test_trainer.py::TrainerIntegrationTest::test_trainer_eval_mrpc\n  /testbed/src/transformers/tokenization_utils_base.py:1302: DeprecationWarning: The `pad_to_max_length` argument is deprecated and will be removed in a future version, use `padding=True` or `padding='longest'` to pad to the longest sequence in the batch, or use `padding='max_length'` to pad to a max length. In this case, you can give a specific length with `max_length` (e.g. `max_length=45`) or leave max_length to None to pad to the maximal input size of the model (e.g. 512 for Bert).\n    warnings.warn(\n\ntests/test_trainer.py::TrainerIntegrationTest::test_trainer_eval_mrpc\n  /testbed/src/transformers/modeling_utils.py:674: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.\n    state_dict = torch.load(resolved_archive_file, map_location=\"cpu\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n======================== 7 passed, 4 warnings in 14.94s ========================\n\n</output>",
+      "timestamp": 1767256870.9468334
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Excellent! All the tests pass. Now let me create a more comprehensive test to simulate the actual GLUE test set scenario described in the PR.\n\n```bash\ncat <<'EOF' > /testbed/test_glue_scenario.py\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256885.9581249,
+      "extra": {
+        "response": {
+          "id": "42bf8fe2008e42a4ac13839b61531336",
+          "created": 1767256871,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Excellent! All the tests pass. Now let me create a more comprehensive test to simulate the actual GLUE test set scenario described in the PR.\n\n```bash\ncat <<'EOF' > /testbed/test_glue_scenario.py\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 1002,
+            "prompt_tokens": 14077,
+            "total_tokens": 15079,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 2 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256885.9715476
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me run the comprehensive GLUE scenario test to verify the fix works for the actual use case described in the PR.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256888.1235228,
+      "extra": {
+        "response": {
+          "id": "4d8bdee861be4f6e8badafcfbf273ab8",
+          "created": 1767256886,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me run the comprehensive GLUE scenario test to verify the fix works for the actual use case described in the PR.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 49,
+            "prompt_tokens": 15178,
+            "total_tokens": 15227,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>2</returncode>\n<output>\npython: can't open file 'test_glue_scenario.py': [Errno 2] No such file or directory\n</output>",
+      "timestamp": 1767256888.2495213
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I need to create the test file first.\n\n```bash\ncat <<'EOF' > /testbed/test_glue_scenario.py\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256892.4045515,
+      "extra": {
+        "response": {
+          "id": "a07ee84716944ea38f99c2db5a9146c4",
+          "created": 1767256888,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I need to create the test file first.\n\n```bash\ncat <<'EOF' > /testbed/test_glue_scenario.py\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 984,
+            "prompt_tokens": 15273,
+            "total_tokens": 16257,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 2 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256892.417083
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me run the GLUE scenario test to verify the fix works correctly.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256893.7716327,
+      "extra": {
+        "response": {
+          "id": "2a24b567e50749a8a92b8a574d5f10f7",
+          "created": 1767256892,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me run the GLUE scenario test to verify the fix works correctly.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 40,
+            "prompt_tokens": 16356,
+            "total_tokens": 16396,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>2</returncode>\n<output>\npython: can't open file 'test_glue_scenario.py': [Errno 2] No such file or directory\n</output>",
+      "timestamp": 1767256893.9032648
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me check what files exist in the testbed directory and create the test file properly.\n\n```bash\nls -la /testbed/test*.py\n```",
+      "timestamp": 1767256896.1616235,
+      "extra": {
+        "response": {
+          "id": "f00c0fb2214c4e7ab9e6fc8aad794c80",
+          "created": 1767256894,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me check what files exist in the testbed directory and create the test file properly.\n\n```bash\nls -la /testbed/test*.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 38,
+            "prompt_tokens": 16442,
+            "total_tokens": 16480,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n-rw-r--r-- 1 root root 1153 Jan  1 08:40 /testbed/test_edge_cases.py\n-rw-r--r-- 1 root root 1212 Jan  1 08:39 /testbed/test_reproduce_issue.py\n</output>",
+      "timestamp": 1767256896.2800303
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: I see the test files I created earlier. Let me create the GLUE scenario test file.\n\n```bash\ncat > /testbed/test_glue_scenario.py << 'EOF'\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256900.952322,
+      "extra": {
+        "response": {
+          "id": "dec160accb6c4257b32431a6d6dec6dd",
+          "created": 1767256896,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: I see the test files I created earlier. Let me create the GLUE scenario test file.\n\n```bash\ncat > /testbed/test_glue_scenario.py << 'EOF'\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\n# Simulate GLUE training dataset features (with labels)\nglue_train_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": 1  # Training set has labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": 0  # Training set has labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\nprint(\"Testing GLUE training set scenario (with labels):\")\ntry:\n    batch = default_data_collator(glue_train_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" in batch:\n        print(\"\u2713 Correctly included 'labels' key when labels are present\")\n        print(\"Labels:\", batch[\"labels\"])\n    else:\n        print(\"\u2717 Unexpectedly excluded 'labels' key\")\n    print()\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\n    print()\n\n# Test the actual use case from the PR - using trainer.predict()\nprint(\"Testing the actual scenario from the PR description:\")\nprint(\"This would be called by trainer.predict(test_dataset=test_dataset)\")\nprint(\"The data collator should handle None labels without crashing.\")\ntry:\n    # This simulates what happens inside trainer.predict()\n    batch = default_data_collator(glue_test_features)\n    print(\"\u2713 SUCCESS - Data collator handles None labels correctly!\")\n    print(\"\u2713 The trainer.predict() method should now work with test datasets\")\nexcept Exception as e:\n    print(\"\u2717 FAILED - Error:\", e)\nEOF\n```\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 993,
+            "prompt_tokens": 16568,
+            "total_tokens": 17561,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "Please always provide EXACTLY ONE action in triple backticks, found 2 actions.\n\nPlease format your action in triple backticks as shown in <response_example>.\n\n<response_example>\nHere are some thoughts about why you want to perform the action.\n\n```bash\n<action>\n```\n</response_example>\n\nIf you have completed your assignment, please consult the first message about how to\nsubmit your solution (you will not be able to continue working on this task after that).",
+      "timestamp": 1767256900.9648418
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me run the GLUE scenario test to verify the fix.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+      "timestamp": 1767256902.5468953,
+      "extra": {
+        "response": {
+          "id": "4be58ef1b01642ed86acea5d8a9028e1",
+          "created": 1767256901,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me run the GLUE scenario test to verify the fix.\n\n```bash\ncd /testbed && python test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 38,
+            "prompt_tokens": 17660,
+            "total_tokens": 17698,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>2</returncode>\n<output>\npython: can't open file 'test_glue_scenario.py': [Errno 2] No such file or directory\n</output>",
+      "timestamp": 1767256902.670735
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Let me check if the file was created and list the directory contents.\n\n```bash\nls -la /testbed/test_glue_scenario.py\n```",
+      "timestamp": 1767256903.5630703,
+      "extra": {
+        "response": {
+          "id": "4ffb9719ffdd4885b8894d19e94e5b64",
+          "created": 1767256902,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Let me check if the file was created and list the directory contents.\n\n```bash\nls -la /testbed/test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 39,
+            "prompt_tokens": 17744,
+            "total_tokens": 17783,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>2</returncode>\n<output>\nls: cannot access '/testbed/test_glue_scenario.py': No such file or directory\n</output>",
+      "timestamp": 1767256903.6776066
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: The file wasn't created. Let me try a different approach using a simpler method.\n\n```bash\necho 'print(\"Test file created\")' > /testbed/test_glue_scenario.py && python /testbed/test_glue_scenario.py\n```",
+      "timestamp": 1767256906.3481207,
+      "extra": {
+        "response": {
+          "id": "5b9b3f1a30794aad96d8f284f3e7d7ee",
+          "created": 1767256903,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: The file wasn't created. Let me try a different approach using a simpler method.\n\n```bash\necho 'print(\"Test file created\")' > /testbed/test_glue_scenario.py && python /testbed/test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 62,
+            "prompt_tokens": 17823,
+            "total_tokens": 17885,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\nTest file created\n</output>",
+      "timestamp": 1767256906.4658852
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Good, now let me overwrite the test file with the actual test content.\n\n```bash\ncat > /testbed/test_glue_scenario.py << 'ENDOFFILE'\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nENDOFFILE\n\npython /testbed/test_glue_scenario.py\n```",
+      "timestamp": 1767256910.3937435,
+      "extra": {
+        "response": {
+          "id": "56a1ceb1b81e4c1ca6272d248c4393e2",
+          "created": 1767256906,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Good, now let me overwrite the test file with the actual test content.\n\n```bash\ncat > /testbed/test_glue_scenario.py << 'ENDOFFILE'\n\"\"\"\nTest script to simulate the GLUE test set prediction scenario described in the PR.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simulate GLUE test dataset features (no labels)\nglue_test_features = [\n    {\n        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n    {\n        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n        \"label\": None  # Test set has no labels\n    },\n]\n\nprint(\"Testing GLUE test set scenario (None labels):\")\ntry:\n    batch = default_data_collator(glue_test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nENDOFFILE\n\npython /testbed/test_glue_scenario.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 467,
+            "prompt_tokens": 17907,
+            "total_tokens": 18374,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:41:52.199252: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:41:52.248279: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:41:53.083389: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting GLUE test set scenario (None labels):\nFAILED - Error: expected sequence of length 8 at dim 1 (got 6)\n</output>",
+      "timestamp": 1767256915.3120291
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: The error is about tensor shapes, not about None labels. This is a different issue related to padding. Let me create a simpler test that focuses on the None label issue.\n\n```bash\ncat > /testbed/test_glue_simple.py << 'ENDOFFILE'\n\"\"\"\nSimple test for None labels in GLUE scenario.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simple test with None labels\ntest_features = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\nprint(\"Testing simple None labels scenario:\")\ntry:\n    batch = default_data_collator(test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n        print(\"Labels:\", batch[\"labels\"])\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nENDOFFILE\n\npython /testbed/test_glue_simple.py\n```",
+      "timestamp": 1767256919.1142209,
+      "extra": {
+        "response": {
+          "id": "aa13b28ca22947afaf229f470d4abf00",
+          "created": 1767256915,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: The error is about tensor shapes, not about None labels. This is a different issue related to padding. Let me create a simpler test that focuses on the None label issue.\n\n```bash\ncat > /testbed/test_glue_simple.py << 'ENDOFFILE'\n\"\"\"\nSimple test for None labels in GLUE scenario.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\n# Simple test with None labels\ntest_features = [\n    {\"input_ids\": [1, 2, 3], \"label\": None},\n    {\"input_ids\": [4, 5, 6], \"label\": None},\n]\n\nprint(\"Testing simple None labels scenario:\")\ntry:\n    batch = default_data_collator(test_features)\n    print(\"SUCCESS!\")\n    print(\"Batch keys:\", list(batch.keys()))\n    print(\"Has 'labels' key:\", \"labels\" in batch)\n    if \"labels\" not in batch:\n        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n    else:\n        print(\"\u2717 Unexpectedly included 'labels' key\")\n        print(\"Labels:\", batch[\"labels\"])\nexcept Exception as e:\n    print(\"FAILED - Error:\", e)\nENDOFFILE\n\npython /testbed/test_glue_simple.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 278,
+            "prompt_tokens": 18622,
+            "total_tokens": 18900,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:42:00.950877: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:42:01.001375: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:42:01.846810: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\nTesting simple None labels scenario:\nSUCCESS!\nBatch keys: ['input_ids']\nHas 'labels' key: False\n\u2713 Correctly excluded 'labels' key when all labels are None\n</output>",
+      "timestamp": 1767256924.1124225
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Perfect! The fix is working correctly. Now let me verify the final state of the modified file to make sure everything is correct.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-65\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,65p'\n```",
+      "timestamp": 1767256927.1010444,
+      "extra": {
+        "response": {
+          "id": "7cffe8362e134447917625c7d6117bfa",
+          "created": 1767256924,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Perfect! The fix is working correctly. Now let me verify the final state of the modified file to make sure everything is correct.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-65\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '42,65p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 105,
+            "prompt_tokens": 19158,
+            "total_tokens": 19263,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 42-65</explore_context>\n<returncode>0</returncode>\n<output>\n    42\t    # Special handling for labels.\n    43\t    # Ensure that tensor is created with the correct type\n    44\t    # (it should be automatically the case, but let's make sure of it.)\n    45\t    if \"label\" in first:\n    46\t        # Check if all labels are None (e.g., for test set prediction)\n    47\t        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n    48\t            # Don't add labels to batch if all are None\n    49\t            pass\n    50\t        else:\n    51\t            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n    52\t            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n    53\t    elif \"label_ids\" in first:\n    54\t        # Check if all label_ids are None (e.g., for test set prediction)\n    55\t        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n    56\t            # Don't add labels to batch if all are None\n    57\t            pass\n    58\t        else:\n    59\t            if isinstance(first[\"label_ids\"], torch.Tensor):\n    60\t                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n    61\t            else:\n    62\t                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n    63\t                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n    64\t\n    65\t    # Handling of all other possible keys.\n</output>",
+      "timestamp": 1767256927.2020965
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Excellent! The fix is in place and working correctly. Let me run one final comprehensive test to make sure everything works as expected.\n\n```bash\ncat > /testbed/test_final_verification.py << 'ENDOFFILE'\n\"\"\"\nFinal verification test for the data collator fix.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\nprint(\"=\" * 60)\nprint(\"FINAL VERIFICATION TEST\")\nprint(\"=\" * 60)\n\n# Test 1: Normal case with integer labels\nprint(\"\\n1. Testing with integer labels:\")\nfeatures_int = [{\"input_ids\": [1, 2], \"label\": 1}, {\"input_ids\": [3, 4], \"label\": 0}]\ntry:\n    batch = default_data_collator(features_int)\n    assert \"labels\" in batch\n    assert torch.equal(batch[\"labels\"], torch.tensor([1, 0]))\n    print(\"   \u2713 PASS - Integer labels work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 2: Normal case with float labels\nprint(\"\\n2. Testing with float labels:\")\nfeatures_float = [{\"input_ids\": [1, 2], \"label\": 1.5}, {\"input_ids\": [3, 4], \"label\": 0.5}]\ntry:\n    batch = default_data_collator(features_float)\n    assert \"labels\" in batch\n    assert torch.allclose(batch[\"labels\"], torch.tensor([1.5, 0.5]))\n    print(\"   \u2713 PASS - Float labels work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 3: None labels (test set scenario)\nprint(\"\\n3. Testing with None labels (test set):\")\nfeatures_none = [{\"input_ids\": [1, 2], \"label\": None}, {\"input_ids\": [3, 4], \"label\": None}]\ntry:\n    batch = default_data_collator(features_none)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - None labels handled correctly (key excluded)\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 4: No label key at all\nprint(\"\\n4. Testing without label key:\")\nfeatures_no_label = [{\"input_ids\": [1, 2]}, {\"input_ids\": [3, 4]}]\ntry:\n    batch = default_data_collator(features_no_label)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - No label key handled correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 5: None label_ids\nprint(\"\\n5. Testing with None label_ids:\")\nfeatures_none_ids = [{\"input_ids\": [1, 2], \"label_ids\": None}, {\"input_ids\": [3, 4], \"label_ids\": None}]\ntry:\n    batch = default_data_collator(features_none_ids)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - None label_ids handled correctly (key excluded)\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 6: Normal label_ids\nprint(\"\\n6. Testing with normal label_ids:\")\nfeatures_ids = [{\"input_ids\": [1, 2], \"label_ids\": [1, 0]}, {\"input_ids\": [3, 4], \"label_ids\": [0, 1]}]\ntry:\n    batch = default_data_collator(features_ids)\n    assert \"labels\" in batch\n    assert torch.equal(batch[\"labels\"], torch.tensor([[1, 0], [0, 1]]))\n    print(\"   \u2713 PASS - Normal label_ids work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\nprint(\"\\n\" + \"=\" * 60)\nprint(\"VERIFICATION COMPLETE\")\nprint(\"=\" * 60)\nENDOFFILE\n\npython /testbed/test_final_verification.py\n```",
+      "timestamp": 1767256941.171537,
+      "extra": {
+        "response": {
+          "id": "766f1a178c8a45018c93e600907b1aa5",
+          "created": 1767256929,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Excellent! The fix is in place and working correctly. Let me run one final comprehensive test to make sure everything works as expected.\n\n```bash\ncat > /testbed/test_final_verification.py << 'ENDOFFILE'\n\"\"\"\nFinal verification test for the data collator fix.\n\"\"\"\nimport torch\nfrom transformers.data.data_collator import default_data_collator\n\nprint(\"=\" * 60)\nprint(\"FINAL VERIFICATION TEST\")\nprint(\"=\" * 60)\n\n# Test 1: Normal case with integer labels\nprint(\"\\n1. Testing with integer labels:\")\nfeatures_int = [{\"input_ids\": [1, 2], \"label\": 1}, {\"input_ids\": [3, 4], \"label\": 0}]\ntry:\n    batch = default_data_collator(features_int)\n    assert \"labels\" in batch\n    assert torch.equal(batch[\"labels\"], torch.tensor([1, 0]))\n    print(\"   \u2713 PASS - Integer labels work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 2: Normal case with float labels\nprint(\"\\n2. Testing with float labels:\")\nfeatures_float = [{\"input_ids\": [1, 2], \"label\": 1.5}, {\"input_ids\": [3, 4], \"label\": 0.5}]\ntry:\n    batch = default_data_collator(features_float)\n    assert \"labels\" in batch\n    assert torch.allclose(batch[\"labels\"], torch.tensor([1.5, 0.5]))\n    print(\"   \u2713 PASS - Float labels work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 3: None labels (test set scenario)\nprint(\"\\n3. Testing with None labels (test set):\")\nfeatures_none = [{\"input_ids\": [1, 2], \"label\": None}, {\"input_ids\": [3, 4], \"label\": None}]\ntry:\n    batch = default_data_collator(features_none)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - None labels handled correctly (key excluded)\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 4: No label key at all\nprint(\"\\n4. Testing without label key:\")\nfeatures_no_label = [{\"input_ids\": [1, 2]}, {\"input_ids\": [3, 4]}]\ntry:\n    batch = default_data_collator(features_no_label)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - No label key handled correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 5: None label_ids\nprint(\"\\n5. Testing with None label_ids:\")\nfeatures_none_ids = [{\"input_ids\": [1, 2], \"label_ids\": None}, {\"input_ids\": [3, 4], \"label_ids\": None}]\ntry:\n    batch = default_data_collator(features_none_ids)\n    assert \"labels\" not in batch\n    print(\"   \u2713 PASS - None label_ids handled correctly (key excluded)\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\n# Test 6: Normal label_ids\nprint(\"\\n6. Testing with normal label_ids:\")\nfeatures_ids = [{\"input_ids\": [1, 2], \"label_ids\": [1, 0]}, {\"input_ids\": [3, 4], \"label_ids\": [0, 1]}]\ntry:\n    batch = default_data_collator(features_ids)\n    assert \"labels\" in batch\n    assert torch.equal(batch[\"labels\"], torch.tensor([[1, 0], [0, 1]]))\n    print(\"   \u2713 PASS - Normal label_ids work correctly\")\nexcept Exception as e:\n    print(f\"   \u2717 FAIL - {e}\")\n\nprint(\"\\n\" + \"=\" * 60)\nprint(\"VERIFICATION COMPLETE\")\nprint(\"=\" * 60)\nENDOFFILE\n\npython /testbed/test_final_verification.py\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 896,
+            "prompt_tokens": 19712,
+            "total_tokens": 20608,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\n2026-01-01 08:42:23.138295: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:42:23.188722: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:42:24.069789: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\n============================================================\nFINAL VERIFICATION TEST\n============================================================\n\n1. Testing with integer labels:\n   \u2713 PASS - Integer labels work correctly\n\n2. Testing with float labels:\n   \u2713 PASS - Float labels work correctly\n\n3. Testing with None labels (test set):\n   \u2713 PASS - None labels handled correctly (key excluded)\n\n4. Testing without label key:\n   \u2713 PASS - No label key handled correctly\n\n5. Testing with None label_ids:\n   \u2713 PASS - None label_ids handled correctly (key excluded)\n\n6. Testing with normal label_ids:\n   \u2713 PASS - Normal label_ids work correctly\n\n============================================================\nVERIFICATION COMPLETE\n============================================================\n</output>",
+      "timestamp": 1767256946.4635093
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Perfect! All tests pass. The fix is working correctly for all scenarios. Let me run the existing test suite one more time to ensure I haven't broken anything.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py::DataCollatorIntegrationTest -xvs 2>&1 | tail -20\n```",
+      "timestamp": 1767256949.8510404,
+      "extra": {
+        "response": {
+          "id": "f5743e1bcdc748faab1fe0001cfc71f0",
+          "created": 1767256946,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Perfect! All tests pass. The fix is working correctly for all scenarios. Let me run the existing test suite one more time to ensure I haven't broken anything.\n\n```bash\ncd /testbed && python -m pytest tests/test_trainer.py::DataCollatorIntegrationTest -xvs 2>&1 | tail -20\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 76,
+            "prompt_tokens": 20976,
+            "total_tokens": 21052,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "\n<returncode>0</returncode>\n<output>\ncollecting ... 2026-01-01 08:42:31.970544: I tensorflow/tsl/cuda/cudart_stub.cc:28] Could not find cuda drivers on your machine, GPU will not be used.\n2026-01-01 08:42:32.023832: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.\nTo enable the following instructions: AVX2 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.\n2026-01-01 08:42:32.897207: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT\ncollected 5 items\n\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_classification PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_regression PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_with_dict PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_lm_tokenizer_with_padding PASSED\ntests/test_trainer.py::DataCollatorIntegrationTest::test_lm_tokenizer_without_padding PASSED\n\n=============================== warnings summary ===============================\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_classification\ntests/test_trainer.py::DataCollatorIntegrationTest::test_default_regression\n  /testbed/src/transformers/tokenization_utils_base.py:1302: DeprecationWarning: The `pad_to_max_length` argument is deprecated and will be removed in a future version, use `padding=True` or `padding='longest'` to pad to the longest sequence in the batch, or use `padding='max_length'` to pad to a max length. In this case, you can give a specific length with `max_length` (e.g. `max_length=45`) or leave max_length to None to pad to the maximal input size of the model (e.g. 512 for Bert).\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n======================== 5 passed, 2 warnings in 6.47s =========================\n</output>",
+      "timestamp": 1767256957.4222567
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Excellent! All the existing tests pass. Now let me create a final summary of the changes and verify the fix one more time by looking at the actual code changes.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-70\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '1,70p'\n```",
+      "timestamp": 1767256960.651149,
+      "extra": {
+        "response": {
+          "id": "bbc8760754eb4850bc1c292bf53cc7af",
+          "created": 1767256957,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Excellent! All the existing tests pass. Now let me create a final summary of the changes and verify the fix one more time by looking at the actual code changes.\n\n<EXPLORE_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-70\n</EXPLORE_CONTEXT>\n\n```bash\nnl -ba /testbed/src/transformers/data/data_collator.py | sed -n '1,70p'\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 110,
+            "prompt_tokens": 21611,
+            "total_tokens": 21721,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<explore_context>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 1-70</explore_context>\n<returncode>0</returncode>\n<output>\n     1\tfrom dataclasses import dataclass\n     2\tfrom typing import Any, Callable, Dict, List, NewType, Tuple\n     3\t\n     4\timport torch\n     5\tfrom torch.nn.utils.rnn import pad_sequence\n     6\t\n     7\tfrom ..tokenization_utils import PreTrainedTokenizer\n     8\t\n     9\t\n    10\tInputDataClass = NewType(\"InputDataClass\", Any)\n    11\t\n    12\t\"\"\"\n    13\tA DataCollator is a function that takes a list of samples from a Dataset\n    14\tand collate them into a batch, as a dictionary of Tensors.\n    15\t\"\"\"\n    16\tDataCollator = NewType(\"DataCollator\", Callable[[List[InputDataClass]], Dict[str, torch.Tensor]])\n    17\t\n    18\t\n    19\tdef default_data_collator(features: List[InputDataClass]) -> Dict[str, torch.Tensor]:\n    20\t    \"\"\"\n    21\t    Very simple data collator that:\n    22\t    - simply collates batches of dict-like objects\n    23\t    - Performs special handling for potential keys named:\n    24\t        - `label`: handles a single value (int or float) per object\n    25\t        - `label_ids`: handles a list of values per object\n    26\t    - does not do any additional preprocessing\n    27\t\n    28\t    i.e., Property names of the input object will be used as corresponding inputs to the model.\n    29\t    See glue and ner for example of how it's useful.\n    30\t    \"\"\"\n    31\t\n    32\t    # In this function we'll make the assumption that all `features` in the batch\n    33\t    # have the same attributes.\n    34\t    # So we will look at the first element as a proxy for what attributes exist\n    35\t    # on the whole batch.\n    36\t    if not isinstance(features[0], dict):\n    37\t        features = [vars(f) for f in features]\n    38\t\n    39\t    first = features[0]\n    40\t    batch = {}\n    41\t\n    42\t    # Special handling for labels.\n    43\t    # Ensure that tensor is created with the correct type\n    44\t    # (it should be automatically the case, but let's make sure of it.)\n    45\t    if \"label\" in first:\n    46\t        # Check if all labels are None (e.g., for test set prediction)\n    47\t        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n    48\t            # Don't add labels to batch if all are None\n    49\t            pass\n    50\t        else:\n    51\t            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n    52\t            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n    53\t    elif \"label_ids\" in first:\n    54\t        # Check if all label_ids are None (e.g., for test set prediction)\n    55\t        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n    56\t            # Don't add labels to batch if all are None\n    57\t            pass\n    58\t        else:\n    59\t            if isinstance(first[\"label_ids\"], torch.Tensor):\n    60\t                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n    61\t            else:\n    62\t                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n    63\t                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n    64\t\n    65\t    # Handling of all other possible keys.\n    66\t    # Again, we will use the first element to figure out which key/values are not None for this model.\n    67\t    for k, v in first.items():\n    68\t        if k not in (\"label\", \"label_ids\") and v is not None and not isinstance(v, str):\n    69\t            if isinstance(v, torch.Tensor):\n    70\t                batch[k] = torch.stack([f[k] for f in features])\n</output>",
+      "timestamp": 1767256960.741032
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Perfect! The fix is complete and working correctly. Let me now submit the solution.\n\n## Summary\n\nI have successfully fixed the issue described in the PR. The problem was that the `default_data_collator` function in `/testbed/src/transformers/data/data_collator.py` was trying to create tensors from `None` values when processing test datasets (which don't have labels).\n\n### Changes Made:\n\n1. **Modified the \"label\" handling** (lines 45-52): Added a check to detect when all labels are `None` and skip adding the \"labels\" key to the batch in that case.\n\n2. **Modified the \"label_ids\" handling** (lines 53-63): Added a similar check for `label_ids` to handle the case where all label_ids are `None`.\n\n### Key Points:\n\n- When all labels are `None` (test set scenario), the \"labels\" key is not added to the batch\n- When labels are present, the behavior remains unchanged\n- The fix handles both \"label\" and \"label_ids\" keys consistently\n- All existing tests pass\n- The fix resolves the exact error mentioned in the PR: `TypeError: must be real number, not NoneType`\n\nThe solution is minimal, robust, and maintains backward compatibility while fixing the issue with test set predictions on GLUE tasks.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+      "timestamp": 1767256966.7063477,
+      "extra": {
+        "response": {
+          "id": "38ad57812d5f4e19859ce71805e8d530",
+          "created": 1767256961,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Perfect! The fix is complete and working correctly. Let me now submit the solution.\n\n## Summary\n\nI have successfully fixed the issue described in the PR. The problem was that the `default_data_collator` function in `/testbed/src/transformers/data/data_collator.py` was trying to create tensors from `None` values when processing test datasets (which don't have labels).\n\n### Changes Made:\n\n1. **Modified the \"label\" handling** (lines 45-52): Added a check to detect when all labels are `None` and skip adding the \"labels\" key to the batch in that case.\n\n2. **Modified the \"label_ids\" handling** (lines 53-63): Added a similar check for `label_ids` to handle the case where all label_ids are `None`.\n\n### Key Points:\n\n- When all labels are `None` (test set scenario), the \"labels\" key is not added to the batch\n- When labels are present, the behavior remains unchanged\n- The fix handles both \"label\" and \"label_ids\" keys consistently\n- All existing tests pass\n- The fix resolves the exact error mentioned in the PR: `TypeError: must be real number, not NoneType`\n\nThe solution is minimal, robust, and maintains backward compatibility while fixing the issue with test set predictions on GLUE tasks.\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 315,
+            "prompt_tokens": 22797,
+            "total_tokens": 23112,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<context_request>\nBefore finalizing your submission, please provide the CODE CONTEXT you used to generate the patch.\n\n**Requirements:**\nList ONLY the specific code sections from source files that you examined to create your patch.\n\n**Format (strictly follow):**\nEach entry must include:\n- File: <absolute_file_path>\n- Lines: <start_line>-<end_line>\n\n**Example:**\n\nFile: /testbed/src/core/handler.ext\nLines: 34-56\n\nFile: /testbed/lib/utils.ext\nLines: 128-145\n\nFile: /testbed/src/parser.ext\nLines: 67-89\n\n**DO NOT include:**\n- Explanations, reasoning, or commentary\n- Error messages or debugging output\n- Test code or test results\n- Documentation or comments\n- Any non-code content\n\nPlease format your response as:\n\nTHOUGHT: Providing code context used for patch generation.\n\n<PATCH_CONTEXT>\nFile: <absolute_file_path>\nLines: <start_line>-<end_line>\n\nFile: <absolute_file_path>\nLines: <start_line>-<end_line>\n</PATCH_CONTEXT>\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```\n\n**CRITICAL:** Provide ONLY file paths and line ranges (no code snippets, no explanations) within <PATCH_CONTEXT> tags.\n</context_request>",
+      "timestamp": 1767256967.1297064
+    },
+    {
+      "role": "assistant",
+      "content": "THOUGHT: Providing code context used for patch generation.\n\n<PATCH_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 19-64\n</PATCH_CONTEXT>\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+      "timestamp": 1767256968.2097707,
+      "extra": {
+        "response": {
+          "id": "10ba549157584010b5120d86ed0f51db",
+          "created": 1767256967,
+          "model": "devstral-2512",
+          "object": "chat.completion",
+          "system_fingerprint": null,
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "message": {
+                "content": "THOUGHT: Providing code context used for patch generation.\n\n<PATCH_CONTEXT>\nFile: /testbed/src/transformers/data/data_collator.py\nLines: 19-64\n</PATCH_CONTEXT>\n\n```bash\necho COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached\n```",
+                "role": "assistant",
+                "tool_calls": null,
+                "function_call": null,
+                "provider_specific_fields": null
+              },
+              "provider_specific_fields": {}
+            }
+          ],
+          "usage": {
+            "completion_tokens": 78,
+            "prompt_tokens": 23418,
+            "total_tokens": 23496,
+            "completion_tokens_details": null,
+            "prompt_tokens_details": null
+          }
+        }
+      }
+    },
+    {
+      "role": "user",
+      "content": "<context_received>\nContext received and recorded (66 characters).\nNow proceeding with final submission.\n</context_received>",
+      "timestamp": 1767256968.2167351
+    },
+    {
+      "role": "user",
+      "content": "diff --git a/Dockerfile b/Dockerfile\nnew file mode 100644\nindex 00000000..803adf79\n--- /dev/null\n+++ b/Dockerfile\n@@ -0,0 +1,31 @@\n+FROM public.ecr.aws/docker/library/python:3.8-slim\n+\n+RUN apt-get update && apt-get install -y git git-lfs && rm -rf /var/lib/apt/lists/*\n+\n+RUN git lfs install\n+WORKDIR /testbed\n+\n+# Install system dependencies\n+RUN apt-get update && apt-get install -y \\\n+    git \\\n+    build-essential \\\n+    && rm -rf /var/lib/apt/lists/*\n+\n+# Copy the repository contents\n+COPY . .\n+\n+\n+# Download model manually\n+RUN git clone https://huggingface.co/google-bert/bert-base-cased-finetuned-mrpc bert-base-cased-finetuned-mrpc\n+\n+\n+# Install Python dependencies\n+RUN pip install --no-cache-dir --upgrade pip\n+RUN pip install --no-cache-dir --retries 3 -e .[testing,torch] pytest\n+RUN pip install --no-cache-dir --retries 3 tensorflow\n+\n+# Set environment variables\n+ENV PYTHONPATH=/testbed\n+ENV TRANSFORMERS_CACHE=/testbed/.cache\n+\n+# Run the specified test file\n\\ No newline at end of file\ndiff --git a/bert-base-cased-finetuned-mrpc b/bert-base-cased-finetuned-mrpc\nnew file mode 160000\nindex 00000000..f150c1d6\n--- /dev/null\n+++ b/bert-base-cased-finetuned-mrpc\n@@ -0,0 +1 @@\n+Subproject commit f150c1d609d1e50dd5e2e5408661cfac8339277c\ndiff --git a/src/transformers/data/data_collator.py b/src/transformers/data/data_collator.py\nindex 5e014d33..ef959f8e 100644\n--- a/src/transformers/data/data_collator.py\n+++ b/src/transformers/data/data_collator.py\n@@ -43,14 +43,24 @@ def default_data_collator(features: List[InputDataClass]) -> Dict[str, torch.Ten\n     # Ensure that tensor is created with the correct type\n     # (it should be automatically the case, but let's make sure of it.)\n     if \"label\" in first:\n-        dtype = torch.long if type(first[\"label\"]) is int else torch.float\n-        batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n+        # Check if all labels are None (e.g., for test set prediction)\n+        if first[\"label\"] is None and all(f.get(\"label\") is None for f in features):\n+            # Don't add labels to batch if all are None\n+            pass\n+        else:\n+            dtype = torch.long if type(first[\"label\"]) is int else torch.float\n+            batch[\"labels\"] = torch.tensor([f[\"label\"] for f in features], dtype=dtype)\n     elif \"label_ids\" in first:\n-        if isinstance(first[\"label_ids\"], torch.Tensor):\n-            batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n+        # Check if all label_ids are None (e.g., for test set prediction)\n+        if first[\"label_ids\"] is None and all(f.get(\"label_ids\") is None for f in features):\n+            # Don't add labels to batch if all are None\n+            pass\n         else:\n-            dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n-            batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n+            if isinstance(first[\"label_ids\"], torch.Tensor):\n+                batch[\"labels\"] = torch.stack([f[\"label_ids\"] for f in features])\n+            else:\n+                dtype = torch.long if type(first[\"label_ids\"][0]) is int else torch.float\n+                batch[\"labels\"] = torch.tensor([f[\"label_ids\"] for f in features], dtype=dtype)\n \n     # Handling of all other possible keys.\n     # Again, we will use the first element to figure out which key/values are not None for this model.\ndiff --git a/test_edge_cases.py b/test_edge_cases.py\nnew file mode 100644\nindex 00000000..31d2cb11\n--- /dev/null\n+++ b/test_edge_cases.py\n@@ -0,0 +1,38 @@\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Edge case 1: Mixed None and non-None labels (should probably fail or handle gracefully)\n+features_mixed_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": 1},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+# Edge case 2: label_ids with None values\n+features_none_label_ids = [\n+    {\"input_ids\": [1, 2, 3], \"label_ids\": None},\n+    {\"input_ids\": [4, 5, 6], \"label_ids\": None},\n+]\n+\n+# Edge case 3: Empty features list (edge case)\n+features_empty = []\n+\n+print(\"Testing edge case 1: Mixed None and non-None labels\")\n+try:\n+    result = default_data_collator(features_mixed_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting edge case 2: None label_ids\")\n+try:\n+    result = default_data_collator(features_none_label_ids)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting edge case 3: Empty features list\")\n+try:\n+    result = default_data_collator(features_empty)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_final_verification.py b/test_final_verification.py\nnew file mode 100644\nindex 00000000..fbff1f14\n--- /dev/null\n+++ b/test_final_verification.py\n@@ -0,0 +1,76 @@\n+\"\"\"\n+Final verification test for the data collator fix.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+print(\"=\" * 60)\n+print(\"FINAL VERIFICATION TEST\")\n+print(\"=\" * 60)\n+\n+# Test 1: Normal case with integer labels\n+print(\"\\n1. Testing with integer labels:\")\n+features_int = [{\"input_ids\": [1, 2], \"label\": 1}, {\"input_ids\": [3, 4], \"label\": 0}]\n+try:\n+    batch = default_data_collator(features_int)\n+    assert \"labels\" in batch\n+    assert torch.equal(batch[\"labels\"], torch.tensor([1, 0]))\n+    print(\"   \u2713 PASS - Integer labels work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 2: Normal case with float labels\n+print(\"\\n2. Testing with float labels:\")\n+features_float = [{\"input_ids\": [1, 2], \"label\": 1.5}, {\"input_ids\": [3, 4], \"label\": 0.5}]\n+try:\n+    batch = default_data_collator(features_float)\n+    assert \"labels\" in batch\n+    assert torch.allclose(batch[\"labels\"], torch.tensor([1.5, 0.5]))\n+    print(\"   \u2713 PASS - Float labels work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 3: None labels (test set scenario)\n+print(\"\\n3. Testing with None labels (test set):\")\n+features_none = [{\"input_ids\": [1, 2], \"label\": None}, {\"input_ids\": [3, 4], \"label\": None}]\n+try:\n+    batch = default_data_collator(features_none)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - None labels handled correctly (key excluded)\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 4: No label key at all\n+print(\"\\n4. Testing without label key:\")\n+features_no_label = [{\"input_ids\": [1, 2]}, {\"input_ids\": [3, 4]}]\n+try:\n+    batch = default_data_collator(features_no_label)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - No label key handled correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 5: None label_ids\n+print(\"\\n5. Testing with None label_ids:\")\n+features_none_ids = [{\"input_ids\": [1, 2], \"label_ids\": None}, {\"input_ids\": [3, 4], \"label_ids\": None}]\n+try:\n+    batch = default_data_collator(features_none_ids)\n+    assert \"labels\" not in batch\n+    print(\"   \u2713 PASS - None label_ids handled correctly (key excluded)\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+# Test 6: Normal label_ids\n+print(\"\\n6. Testing with normal label_ids:\")\n+features_ids = [{\"input_ids\": [1, 2], \"label_ids\": [1, 0]}, {\"input_ids\": [3, 4], \"label_ids\": [0, 1]}]\n+try:\n+    batch = default_data_collator(features_ids)\n+    assert \"labels\" in batch\n+    assert torch.equal(batch[\"labels\"], torch.tensor([[1, 0], [0, 1]]))\n+    print(\"   \u2713 PASS - Normal label_ids work correctly\")\n+except Exception as e:\n+    print(f\"   \u2717 FAIL - {e}\")\n+\n+print(\"\\n\" + \"=\" * 60)\n+print(\"VERIFICATION COMPLETE\")\n+print(\"=\" * 60)\ndiff --git a/test_glue_scenario.py b/test_glue_scenario.py\nnew file mode 100644\nindex 00000000..56abc8e7\n--- /dev/null\n+++ b/test_glue_scenario.py\n@@ -0,0 +1,34 @@\n+\"\"\"\n+Test script to simulate the GLUE test set prediction scenario described in the PR.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Simulate GLUE test dataset features (no labels)\n+glue_test_features = [\n+    {\n+        \"input_ids\": [101, 1996, 2003, 1029, 2000, 2002, 2102, 102],\n+        \"attention_mask\": [1, 1, 1, 1, 1, 1, 1, 1],\n+        \"token_type_ids\": [0, 0, 0, 0, 0, 0, 0, 0],\n+        \"label\": None  # Test set has no labels\n+    },\n+    {\n+        \"input_ids\": [101, 1996, 2017, 2006, 2034, 102],\n+        \"attention_mask\": [1, 1, 1, 1, 1, 1],\n+        \"token_type_ids\": [0, 0, 0, 0, 0, 0],\n+        \"label\": None  # Test set has no labels\n+    },\n+]\n+\n+print(\"Testing GLUE test set scenario (None labels):\")\n+try:\n+    batch = default_data_collator(glue_test_features)\n+    print(\"SUCCESS!\")\n+    print(\"Batch keys:\", list(batch.keys()))\n+    print(\"Has 'labels' key:\", \"labels\" in batch)\n+    if \"labels\" not in batch:\n+        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n+    else:\n+        print(\"\u2717 Unexpectedly included 'labels' key\")\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_glue_simple.py b/test_glue_simple.py\nnew file mode 100644\nindex 00000000..facbf751\n--- /dev/null\n+++ b/test_glue_simple.py\n@@ -0,0 +1,25 @@\n+\"\"\"\n+Simple test for None labels in GLUE scenario.\n+\"\"\"\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Simple test with None labels\n+test_features = [\n+    {\"input_ids\": [1, 2, 3], \"label\": None},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+print(\"Testing simple None labels scenario:\")\n+try:\n+    batch = default_data_collator(test_features)\n+    print(\"SUCCESS!\")\n+    print(\"Batch keys:\", list(batch.keys()))\n+    print(\"Has 'labels' key:\", \"labels\" in batch)\n+    if \"labels\" not in batch:\n+        print(\"\u2713 Correctly excluded 'labels' key when all labels are None\")\n+    else:\n+        print(\"\u2717 Unexpectedly included 'labels' key\")\n+        print(\"Labels:\", batch[\"labels\"])\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\ndiff --git a/test_reproduce_issue.py b/test_reproduce_issue.py\nnew file mode 100644\nindex 00000000..1ff23a85\n--- /dev/null\n+++ b/test_reproduce_issue.py\n@@ -0,0 +1,41 @@\n+import torch\n+from transformers.data.data_collator import default_data_collator\n+\n+# Test case 1: Normal case with labels\n+features_with_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": 1},\n+    {\"input_ids\": [4, 5, 6], \"label\": 0},\n+]\n+\n+# Test case 2: Test set case with None labels (this should fail with current code)\n+features_with_none_labels = [\n+    {\"input_ids\": [1, 2, 3], \"label\": None},\n+    {\"input_ids\": [4, 5, 6], \"label\": None},\n+]\n+\n+# Test case 3: Features without label key\n+features_without_labels = [\n+    {\"input_ids\": [1, 2, 3]},\n+    {\"input_ids\": [4, 5, 6]},\n+]\n+\n+print(\"Testing case 1: Features with labels\")\n+try:\n+    result = default_data_collator(features_with_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting case 2: Features with None labels (test set)\")\n+try:\n+    result = default_data_collator(features_with_none_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n+\n+print(\"\\nTesting case 3: Features without label key\")\n+try:\n+    result = default_data_collator(features_without_labels)\n+    print(\"SUCCESS - Result:\", result)\n+except Exception as e:\n+    print(\"FAILED - Error:\", e)\n",
+      "timestamp": 1767256999.7037544
+    }
+  ],
+  "trajectory_format": "mini-swe-agent-1",
+  "instance_id": "huggingface__transformers-5122"
+}

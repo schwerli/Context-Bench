@@ -1,0 +1,166 @@
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index 89730cee29..15fb790e58 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -76,6 +76,24 @@ class DatabaseOperations(BaseDatabaseOperations):
+             return "DATE(%s)" % (field_name)
+ 
+     def _prepare_tzname_delta(self, tzname):
++        """
++        MySQL CONVERT_TZ accepts named time zones or numeric offsets.
++        For names like 'Etc/GMT±HH', return the equivalent numeric offset
++        with the reversed sign (Etc/GMT-10 -> '+10'). For purely numeric
++        offsets (e.g. '+10', '-04:00'), return them unchanged. Otherwise,
++        if a name contains a '+' or '-', attempt to extract the numeric
++        part starting at the sign.
++        """
++        import re
++        m = re.match(r"^Etc/GMT([+-])(\d{1,2})$", tzname)
++        if m:
++            sign, hours = m.groups()
++            # Reverse sign to get the true offset direction.
++            return ('+' if sign == '-' else '-') + hours
++        # Pure numeric offset.
++        if re.match(r"^[+-]\d{1,2}(:\d{2})?$", tzname):
++            return tzname
++        # Fallback: extract substring starting at first sign.
+         if '+' in tzname:
+             return tzname[tzname.find('+'):]
+         elif '-' in tzname:
+diff --git a/django/db/backends/oracle/operations.py b/django/db/backends/oracle/operations.py
+index 4cfc7da070..f711cae23d 100644
+--- a/django/db/backends/oracle/operations.py
++++ b/django/db/backends/oracle/operations.py
+@@ -108,6 +108,20 @@ END;
+     _tzname_re = _lazy_re_compile(r'^[\w/:+-]+$')
+ 
+     def _prepare_tzname_delta(self, tzname):
++        """
++        Oracle FROM_TZ/AT TIME ZONE accepts named time zones or numeric offsets.
++        For names like 'Etc/GMT±HH', return the equivalent numeric offset with
++        reversed sign (Etc/GMT-10 -> '+10'). For purely numeric offsets, return
++        unchanged. Otherwise, fall back to extracting substring starting at the
++        first sign.
++        """
++        import re
++        m = re.match(r"^Etc/GMT([+-])(\d{1,2})$", tzname)
++        if m:
++            sign, hours = m.groups()
++            return ('+' if sign == '-' else '-') + hours
++        if re.match(r"^[+-]\d{1,2}(:\d{2})?$", tzname):
++            return tzname
+         if '+' in tzname:
+             return tzname[tzname.find('+'):]
+         elif '-' in tzname:
+diff --git a/django/db/backends/postgresql/operations.py b/django/db/backends/postgresql/operations.py
+index 8d19872bea..9c14b1808f 100644
+--- a/django/db/backends/postgresql/operations.py
++++ b/django/db/backends/postgresql/operations.py
+@@ -44,10 +44,17 @@ class DatabaseOperations(BaseDatabaseOperations):
+         return "DATE_TRUNC('%s', %s)" % (lookup_type, field_name)
+ 
+     def _prepare_tzname_delta(self, tzname):
+-        if '+' in tzname:
+-            return tzname.replace('+', '-')
+-        elif '-' in tzname:
+-            return tzname.replace('-', '+')
++        """
++        For PostgreSQL, AT TIME ZONE expects a numeric offset to be opposite
++        of the intended tzinfo direction (e.g. '+10' -> '-10'). However, if a
++        full time zone name is provided (e.g. 'Etc/GMT-10' or 'Europe/Paris'),
++        it must be passed through unchanged. Only flip the sign for pure
++        numeric offsets of the form [+|-]HH or [+|-]HH:MM.
++        """
++        import re
++        if re.match(r"^[+-]\d{1,2}(:\d{2})?$", tzname):
++            # Flip only the leading sign for numeric offsets.
++            return ('-' + tzname[1:]) if tzname[0] == '+' else ('+' + tzname[1:])
+         return tzname
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+diff --git a/psycopg2/__init__.py b/psycopg2/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/psycopg2/extras.py} b/psycopg2/extras.py}
+new file mode 100644
+index 0000000000..df1b2eb94e
+--- /dev/null
++++ b/psycopg2/extras.py}
+@@ -0,0 +1,2 @@
++class Inet(str):
++    pass
+diff --git a/repro_pg_run.py b/repro_pg_run.py
+new file mode 100644
+index 0000000000..0d00b59b94
+--- /dev/null
++++ b/repro_pg_run.py
+@@ -0,0 +1,24 @@
++from django.conf import settings
++settings.configure(USE_TZ=True)
++from django.utils import timezone
++import pytz
++from types import SimpleNamespace
++import sys, types
++# Fake psycopg2 extras Inet to allow importing operations without real psycopg2
++ps = types.ModuleType('psycopg2')
++ps_extras = types.ModuleType('psycopg2.extras')
++class Inet(str):
++    pass
++ps_extras.Inet = Inet
++sys.modules['psycopg2'] = ps
++sys.modules['psycopg2.extras'] = ps_extras
++
++from django.db.backends.postgresql.operations import DatabaseOperations
++ops = DatabaseOperations(connection=SimpleNamespace(ops=None, features=None, timezone_name='UTC'))
++field = '"my_model"."start_at"'
++for tz in ['+10','-04:00']:
++    print(tz,'->',ops._convert_field_to_tz(field, tz))
++for key in ['Etc/GMT-10','Etc/GMT+10']:
++    tz = pytz.timezone(key)
++    tzname = timezone._get_timezone_name(tz)
++    print(key,'name=',tzname,'->', ops._convert_field_to_tz(field, tzname))
+diff --git a/repro_tz.py b/repro_tz.py
+new file mode 100644
+index 0000000000..db15496fa3
+--- /dev/null
++++ b/repro_tz.py
+@@ -0,0 +1,17 @@
++from django.conf import settings
++settings.configure(USE_TZ=True)
++
++from django.utils import timezone
++import pytz
++
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++# Simulate conversion for a DateTimeField using tzinfo 'Etc/GMT-10'
++tz = pytz.timezone('Etc/GMT-10')
++tzname = timezone._get_timezone_name(tz)
++ops = DatabaseOperations(connection=None)
++field_sql = '"my_model"."start_at"'
++
++converted = ops._convert_field_to_tz(field_sql, tzname)
++print('tzname:', tzname)
++print('converted SQL:', converted)
+diff --git a/repro_tz_pg.py b/repro_tz_pg.py
+new file mode 100644
+index 0000000000..3e40103425
+--- /dev/null
++++ b/repro_tz_pg.py
+@@ -0,0 +1,16 @@
++from django.conf import settings
++settings.configure(USE_TZ=True)
++
++from django.utils import timezone
++import pytz
++
++from django.db.backends.postgresql.operations import DatabaseOperations
++
++# Simulate conversion for a DateTimeField using tzinfo 'Etc/GMT-10'
++for tzkey in ['Etc/GMT-10', 'Etc/GMT+10', '+10', '-10', '+10:30', '-04:00']:
++    tz = pytz.timezone(tzkey) if tzkey.startswith('Etc/') else tzkey
++    tzname = timezone._get_timezone_name(tz)
++    ops = DatabaseOperations(connection=type('C', (), {'ops': None, 'features': None, 'timezone_name': 'UTC'})())
++    field_sql = '"my_model"."start_at"'
++    converted = ops._convert_field_to_tz(field_sql, tzname)
++    print(tzkey, '-> tzname:', tzname, '| converted SQL:', converted)

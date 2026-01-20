@@ -1,0 +1,107 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index f2ca8c8df9..cd0a5033fe 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -527,8 +527,14 @@ class BaseDatabaseSchemaEditor:
+         news = {tuple(fields) for fields in new_unique_together}
+         # Deleted uniques
+         for fields in olds.difference(news):
++            # Exclude primary key constraints when looking for unique constraints
++            # to delete as part of unique_together changes. Some backends (e.g.,
++            # PostgreSQL and MySQL) mark primary keys as unique, which can result
++            # in multiple matches when dropping a single-column unique_together
++            # on a primary key field. Filtering by primary_key=False ensures only
++            # the actual unique_together constraint is targeted.
+             self._delete_composed_index(
+-                model, fields, {"unique": True}, self.sql_delete_unique
++                model, fields, {"unique": True, "primary_key": False}, self.sql_delete_unique
+             )
+         # Created uniques
+         for field_names in news.difference(olds):
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..95992e0ebb
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,81 @@
++# Repro script for dropping unique_together on a single column that also has another unique constraint (e.g., primary key)
++# This simulates the behavior of BaseDatabaseSchemaEditor.alter_unique_together and _delete_composed_index.
++
++from django.db.backends.base.schema import BaseDatabaseSchemaEditor
++
++class FakeField:
++    def __init__(self, name, column):
++        self.name = name
++        self.column = column
++
++class FakeMeta:
++    def __init__(self):
++        self.db_table = "foo_bar"
++        self.constraints = []
++        self.indexes = []
++        self.unique_together = [("id",)]
++        self._fields = {"id": FakeField("id", "id")}
++    def get_field(self, name):
++        return self._fields[name]
++
++class FakeModel:
++    def __init__(self):
++        self._meta = FakeMeta()
++
++class FakeConnection:
++    class Features:
++        # For this repro we don't need special features
++        supports_deferrable_unique_constraints = True
++        supports_partial_indexes = True
++        supports_covering_indexes = True
++        supports_expression_indexes = True
++        can_rollback_ddl = True
++        connection_persists_old_columns = False
++    def __init__(self):
++        self.features = self.Features()
++        self.introspection = None
++        self.ops = type("Ops", (), {"quote_name": staticmethod(lambda s: '"' + s + '"')})()
++    def cursor(self):
++        raise RuntimeError("Not used in this repro")
++    def close(self):
++        pass
++
++class FakeSchemaEditor(BaseDatabaseSchemaEditor):
++    def __init__(self):
++        super().__init__(FakeConnection(), collect_sql=True, atomic=False)
++    def execute(self, sql, params=()):
++        # Collect SQL for demonstration
++        if self.collect_sql:
++            self.collected_sql.append(sql)
++        else:
++            print(sql)
++    def _constraint_names(self, model, column_names=None, unique=None, primary_key=None, index=None, foreign_key=None, check=None, type_=None, exclude=None):
++        # Simulate Postgres introspection returning both PK and a UNIQUE constraint on the same column when unique=True is queried.
++        # We ignore the column_names filtering for simplicity as we know it's the same column.
++        names = []
++        # If searching for unique constraints, return both pk and unique unless primary_key is explicitly filtered.
++        if unique is True:
++            if primary_key is False:
++                names = ["foo_bar_id_1c3b3088c74c3b17_uniq"]
++            else:
++                names = ["foo_bar_pkey", "foo_bar_id_1c3b3088c74c3b17_uniq"]
++        elif primary_key is True:
++            names = ["foo_bar_pkey"]
++        elif index is True:
++            names = ["foo_bar_id_like_idx"]
++        return names
++    def _delete_constraint_sql(self, template, model, name):
++        # Return a simplified SQL string similar to Statement rendering
++        return f"ALTER TABLE \"{model._meta.db_table}\" DROP CONSTRAINT \"{name}\""
++
++if __name__ == "__main__":
++    editor = FakeSchemaEditor()
++    model = FakeModel()
++    try:
++        # Attempt to drop unique_together going from [("id",)] to []
++        editor.alter_unique_together(model, [("id",)], [])
++        print("No error. SQL to run:")
++        for sql in editor.collected_sql:
++            print(sql)
++    except Exception as e:
++        print("Error raised:", type(e).__name__, str(e))

@@ -1,0 +1,85 @@
+diff --git a/repro_caplog_conflict.py b/repro_caplog_conflict.py
+new file mode 100644
+index 000000000..76c7426e9
+--- /dev/null
++++ b/repro_caplog_conflict.py
+@@ -0,0 +1,47 @@
++import logging
++import os
++import sys
++
++# Ensure we import pytest from this repo
++repo_src = os.path.join(os.path.dirname(__file__), 'src')
++if repo_src not in sys.path:
++    sys.path.insert(0, repo_src)
++
++import pytest
++
++print('Using pytest from:', pytest.__file__)
++
++TEST_CODE = r'''
++import logging
++
++def test(caplog):
++    def verify_consistency():
++        assert caplog.get_records("call") == caplog.records
++
++    verify_consistency()
++    logging.warning("test")
++    verify_consistency()
++    caplog.clear()
++    verify_consistency()  # fails currently
++'''
++
++def main():
++    import tempfile, textwrap
++    from pathlib import Path
++    d = Path(tempfile.mkdtemp(prefix="caplog_conflict_"))
++    test_file = d / "test_conflict.py"
++    test_file.write_text(textwrap.dedent(TEST_CODE))
++    print('Running pytest on', test_file)
++    # run pytest programmatically to ensure it uses the imported pytest
++    # but simpler: shell out to python -m pytest with PYTHONPATH set via env
++    import subprocess, sys
++    env = dict(os.environ)
++    env['PYTHONPATH'] = repo_src + (os.pathsep + env.get('PYTHONPATH',''))
++    cmd = [sys.executable, '-m', 'pytest', '-q', str(test_file)]
++    print('Command:', ' '.join(cmd))
++    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++    print(proc.stdout)
++    sys.exit(proc.returncode)
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index a4f4214b1..06dd7b1b7 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -439,8 +439,26 @@ class LogCaptureFixture:
+         return [r.getMessage() for r in self.records]
+ 
+     def clear(self) -> None:
+-        """Reset the list of log records and the captured log text."""
++        """Reset the list of log records and the captured log text.
++
++        Also ensure that caplog.get_records(<when>) stays consistent with
++        caplog.records after clearing by updating the stored references
++        to the phase-specific record lists to point to the new handler list.
++        """
++        # Keep a reference to the current list so we can update only entries
++        # that pointed to the old list (i.e., the active phase).
++        old_list = self.handler.records
+         self.handler.reset()
++        new_list = self.handler.records
++        # Update the stored per-phase list to reference the new handler.records
++        try:
++            records_by_when = self._item.stash[caplog_records_key]
++        except KeyError:
++            records_by_when = None
++        if records_by_when:
++            for when, lst in list(records_by_when.items()):
++                if lst is old_list:
++                    records_by_when[when] = new_list
+ 
+     def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+         """Set the level of a logger for the duration of a test.

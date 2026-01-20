@@ -1,0 +1,119 @@
+diff --git a/django/contrib/admin/sites.py b/django/contrib/admin/sites.py
+index 59a4a0364d..d9ab81c761 100644
+--- a/django/contrib/admin/sites.py
++++ b/django/contrib/admin/sites.py
+@@ -420,14 +420,18 @@ class AdminSite:
+     def catch_all_view(self, request, url):
+         if settings.APPEND_SLASH and not url.endswith('/'):
+             urlconf = getattr(request, 'urlconf', None)
+-            path = '%s/' % request.path_info
++            # Use path_info for resolving against URLconf, but build the
++            # redirect target from request.path so that FORCE_SCRIPT_NAME (and
++            # any script name/prefix) is preserved.
++            path_to_resolve = '%s/' % request.path_info
++            redirect_path = request.get_full_path(force_append_slash=True)
+             try:
+-                match = resolve(path, urlconf)
++                match = resolve(path_to_resolve, urlconf)
+             except Resolver404:
+                 pass
+             else:
+                 if getattr(match.func, 'should_append_slash', True):
+-                    return HttpResponsePermanentRedirect(path)
++                    return HttpResponsePermanentRedirect(redirect_path)
+         raise Http404
+ 
+     def _build_app_dict(self, request, label=None):
+diff --git a/repro_force_script_name.py b/repro_force_script_name.py
+new file mode 100644
+index 0000000000..a43f6a6f2d
+--- /dev/null
++++ b/repro_force_script_name.py
+@@ -0,0 +1,87 @@
++from django.conf import settings
++from django.http import HttpRequest
++from django.contrib.admin.sites import AdminSite
++import django
++
++# Minimal settings configuration for standalone script.
++if not settings.configured:
++    settings.configure(
++        DEBUG=True,
++        SECRET_KEY='test',
++        APPEND_SLASH=True,
++        FORCE_SCRIPT_NAME='/PREFIX',
++        ALLOWED_HOSTS=['testserver'],
++        ROOT_URLCONF='django.contrib.admin.sites',  # not used but required by Django init sometimes
++        MIDDLEWARE=[],
++        INSTALLED_APPS=['django.contrib.admin', 'django.contrib.auth', 'django.contrib.contenttypes'],
++        TEMPLATES=[{
++            'BACKEND': 'django.template.backends.django.DjangoTemplates',
++            'APP_DIRS': True,
++            'DIRS': [],
++        }],
++        DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}},
++    )
++
++django.setup()
++
++# Stub resolve to simulate a matching view with should_append_slash=True.
++class Match:
++    class Func:
++        should_append_slash = True
++    func = Func()
++
++def stub_resolve(path, urlconf=None):
++    # Only return a match for path ending with '/' appended.
++    return Match()
++
++# Monkey-patch resolve in admin.sites module.
++import django.contrib.admin.sites as admin_sites
++admin_sites.resolve = stub_resolve
++
++# Prepare a request with FORCE_SCRIPT_NAME respected in request.path.
++req = HttpRequest()
++req.path_info = '/admin/resource'
++# WSGIRequest would set path to script_name + path_info.
++req.path = settings.FORCE_SCRIPT_NAME.rstrip('/') + req.path_info
++req.META = {'QUERY_STRING': ''}
++
++site = AdminSite()
++
++# Simulate old behavior for comparison.
++def old_catch_all_view(request, url):
++    from django.http import Http404, HttpResponsePermanentRedirect
++    from django.urls import Resolver404
++    if settings.APPEND_SLASH and not url.endswith('/'):
++        urlconf = getattr(request, 'urlconf', None)
++        path = '%s/' % request.path_info
++        try:
++            match = admin_sites.resolve(path, urlconf)
++        except Resolver404:
++            pass
++        else:
++            if getattr(match.func, 'should_append_slash', True):
++                return HttpResponsePermanentRedirect(path)
++    raise Http404
++
++try:
++    resp_old = old_catch_all_view(req, 'admin/resource')
++    print('OLD redirect location:', resp_old.url)
++except Exception as e:
++    print('OLD behavior raised:', type(e).__name__, e)
++
++try:
++    resp_new = site.catch_all_view(req, 'admin/resource')
++    print('NEW redirect location:', resp_new.url)
++except Exception as e:
++    print('NEW behavior raised:', type(e).__name__, e)
++
++# Try with query string
++req_qs = HttpRequest()
++req_qs.path_info = '/admin/resource'
++req_qs.path = settings.FORCE_SCRIPT_NAME.rstrip('/') + req_qs.path_info
++req_qs.META = {'QUERY_STRING': 'a=1&b=2'}
++try:
++    resp_new_qs = site.catch_all_view(req_qs, 'admin/resource')
++    print('NEW redirect with query:', resp_new_qs.url)
++except Exception as e:
++    print('NEW behavior raised (qs):', type(e).__name__, e)

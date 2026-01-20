@@ -1,0 +1,139 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 36f88f99ec..2620b1f224 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -739,11 +739,34 @@ class Col(Expression):
+     def get_group_by_cols(self, alias=None):
+         return [self]
+ 
+-    def get_db_converters(self, connection):
+-        if self.target == self.output_field:
+-            return self.output_field.get_db_converters(connection)
+-        return (self.output_field.get_db_converters(connection) +
+-                self.target.get_db_converters(connection))
++
++class OrderByPosition(Expression):
++    """
++    Internal expression used to refer to a result column by its positional
++    index in ORDER BY clauses for combined (compound) queries like UNION,
++    INTERSECTION, and DIFFERENCE.
++
++    Some backends support ordering by select-list position using a bare
++    integer (e.g. ORDER BY 1). Using RawSQL here would wrap the integer in
++    parentheses (ORDER BY (1)), which can cause errors on certain backends
++    when used with compound queries. This expression compiles to the bare
++    integer without additional parentheses.
++    """
++    def __init__(self, position):
++        super().__init__()
++        self.position = int(position)
++
++    def __repr__(self):
++        return "{}({})".format(self.__class__.__name__, self.position)
++
++    def as_sql(self, compiler, connection):
++        # Emit the position as a bare integer; no params required.
++        return str(self.position), []
++
++    def get_group_by_cols(self, alias=None):
++        # Positional ORDER BY doesn't contribute grouping columns.
++        return []
++
+ 
+ 
+ class SimpleCol(Expression):
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index a791908caf..b6247313d6 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -5,7 +5,7 @@ from itertools import chain
+ 
+ from django.core.exceptions import EmptyResultSet, FieldError
+ from django.db.models.constants import LOOKUP_SEP
+-from django.db.models.expressions import OrderBy, Random, RawSQL, Ref, Value
++from django.db.models.expressions import OrderBy, Random, RawSQL, Ref, Value, OrderByPosition
+ from django.db.models.functions import Cast
+ from django.db.models.query_utils import QueryWrapper, select_related_descend
+ from django.db.models.sql.constants import (
+@@ -353,7 +353,7 @@ class SQLCompiler:
+                     elif col_alias:
+                         continue
+                     if src == sel_expr:
+-                        resolved.set_source_expressions([RawSQL('%d' % (idx + 1), ())])
++                        resolved.set_source_expressions([OrderByPosition(idx + 1)])
+                         break
+                 else:
+                     raise DatabaseError('ORDER BY term does not match any column in the result set.')
+diff --git a/repro_union_ordering.py b/repro_union_ordering.py
+new file mode 100644
+index 0000000000..5b97220653
+--- /dev/null
++++ b/repro_union_ordering.py
+@@ -0,0 +1,67 @@
++# Reproduction script for union queryset ordering derived querysets bug
++import django
++import os
++import sys
++
++# Configure settings for tests environment by setting DJANGO_SETTINGS_MODULE
++os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'tests.settings_tests.settings')
++# Manually configure Django settings and database.
++from django.conf import settings
++ALWAYS_INSTALLED_APPS = [
++    'django.contrib.contenttypes',
++    'django.contrib.auth',
++    'django.contrib.sites',
++    'django.contrib.sessions',
++    'django.contrib.messages',
++    'django.contrib.admin.apps.SimpleAdminConfig',
++    'django.contrib.staticfiles',
++]
++ALWAYS_MIDDLEWARE = [
++    'django.contrib.sessions.middleware.SessionMiddleware',
++    'django.middleware.common.CommonMiddleware',
++    'django.middleware.csrf.CsrfViewMiddleware',
++    'django.contrib.auth.middleware.AuthenticationMiddleware',
++    'django.contrib.messages.middleware.MessageMiddleware',
++]
++TMPDIR = '/tmp/django_tmp'
++os.makedirs(TMPDIR, exist_ok=True)
++settings.configure(
++    INSTALLED_APPS=ALWAYS_INSTALLED_APPS + ['tests.queries'],
++    MIDDLEWARE=ALWAYS_MIDDLEWARE,
++    ROOT_URLCONF='tests.urls',
++    STATIC_URL='/static/',
++    STATIC_ROOT=os.path.join(TMPDIR, 'static'),
++    TEMPLATES=[{
++        'BACKEND': 'django.template.backends.django.DjangoTemplates',
++        'DIRS': [os.path.join('/testbed/tests', 'templates')],
++        'APP_DIRS': True,
++        'OPTIONS': {'context_processors': []},
++    }],
++    DATABASES={'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': os.path.join(TMPDIR, 'db.sqlite3')}},
++    SITE_ID=1,
++    LOGGING_CONFIG=None,
++)
++
++# minimal setup to initialize django
++import django
++from django.core.management import call_command
++django.setup()
++# Create tables for apps without migrations
++call_command('migrate', run_syncdb=True, interactive=False, verbosity=0)
++
++from tests.queries.models import Number
++
++# Create sample data
++Number.objects.all().delete()
++for i in range(10):
++    Number.objects.create(num=i)
++
++qs1 = Number.objects.filter(num__lte=1)
++qs2 = Number.objects.filter(num__gte=8)
++
++qs = qs1.union(qs2)
++print('Initial union ordered desc:', list(qs.order_by('-num')))
++# Trigger evaluation order
++print('Order_by none values_list flat:', list(qs.order_by().values_list('pk', flat=True)))
++# Now re-evaluate original qs
++print('Re-evaluate original qs:', list(qs))
